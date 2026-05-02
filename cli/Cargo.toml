@@ -1,0 +1,17 @@
+[package]
+name = "slack-sessions-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "slack-sessions"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+rpassword = "7"
+anyhow = "1"

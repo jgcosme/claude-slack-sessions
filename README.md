@@ -1,3 +1,10 @@
+---
+type: reference
+description: "Overview of slack-sessions plugin - one isolated Claude Code session per Slack thread, early scaffold status."
+created: 2026-05-02
+project: claude-slack-sessions
+---
+
 # slack-sessions
 
 Drive Claude Code from Slack with **one isolated session per Slack thread**.
