@@ -1,6 +1,11 @@
+mod projects;
+
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use keyring::Entry;
+use std::path::PathBuf;
+
+use crate::projects::ProjectsRegistry;
 
 const SERVICE: &str = "slack-sessions";
 const APP_TOKEN_ACCOUNT: &str = "app-token";
@@ -25,6 +30,30 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Manage the project registry used for !<name> selection in Slack
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Add or update a named project (path must exist)
+    Add {
+        name: String,
+        path: PathBuf,
+    },
+    /// List all registered projects and the default working directory
+    List,
+    /// Remove a named project
+    Remove {
+        name: String,
+    },
+    /// Set the default working directory used when no !<name> prefix is given
+    SetDefault {
+        path: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -37,6 +66,12 @@ fn main() -> Result<()> {
                 setup_interactive()
             }
         }
+        Command::Project { action } => match action {
+            ProjectAction::Add { name, path } => project_add(&name, &path),
+            ProjectAction::List => project_list(),
+            ProjectAction::Remove { name } => project_remove(&name),
+            ProjectAction::SetDefault { path } => project_set_default(&path),
+        },
     }
 }
 
@@ -127,4 +162,62 @@ fn mask(s: &str) -> String {
     } else {
         format!("{}...{}", &s[..8], &s[s.len() - 4..])
     }
+}
+
+fn project_add(name: &str, path: &PathBuf) -> Result<()> {
+    ProjectsRegistry::validate_name(name).map_err(|e| anyhow!(e))?;
+    let canonical = projects::canonicalize_dir(&path.to_string_lossy()).map_err(|e| anyhow!(e))?;
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let mut reg = ProjectsRegistry::load().context("failed to load registry")?;
+    let prior = reg
+        .projects
+        .insert(name.to_string(), canonical_str.clone());
+    reg.save().context("failed to save registry")?;
+    if prior.is_some() {
+        println!("[ok] updated {} -> {}", name, canonical_str);
+    } else {
+        println!("[ok] added {} -> {}", name, canonical_str);
+    }
+    Ok(())
+}
+
+fn project_list() -> Result<()> {
+    let reg = ProjectsRegistry::load().context("failed to load registry")?;
+    let default = reg.resolved_default();
+    println!("default working directory: {}", default.display());
+    if reg.default_dir.is_none() {
+        println!("  (using $HOME — set with `slack-sessions project set-default <path>`)");
+    }
+    println!();
+    if reg.projects.is_empty() {
+        println!("no registered projects.");
+        println!("add one with: slack-sessions project add <name> <path>");
+        return Ok(());
+    }
+    println!("registered projects:");
+    let max_name = reg.projects.keys().map(|k| k.len()).max().unwrap_or(0);
+    for (name, path) in &reg.projects {
+        println!("  {:width$}  {}", name, path, width = max_name);
+    }
+    Ok(())
+}
+
+fn project_remove(name: &str) -> Result<()> {
+    let mut reg = ProjectsRegistry::load().context("failed to load registry")?;
+    if reg.projects.remove(name).is_none() {
+        return Err(anyhow!("no project named {:?}", name));
+    }
+    reg.save().context("failed to save registry")?;
+    println!("[ok] removed {}", name);
+    Ok(())
+}
+
+fn project_set_default(path: &PathBuf) -> Result<()> {
+    let canonical = projects::canonicalize_dir(&path.to_string_lossy()).map_err(|e| anyhow!(e))?;
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let mut reg = ProjectsRegistry::load().context("failed to load registry")?;
+    reg.default_dir = Some(canonical_str.clone());
+    reg.save().context("failed to save registry")?;
+    println!("[ok] default working directory: {}", canonical_str);
+    Ok(())
 }

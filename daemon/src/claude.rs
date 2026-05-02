@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -53,9 +54,11 @@ pub struct ClaudeResult {
 pub async fn run_turn(
     prompt: &str,
     resume_session_id: Option<&str>,
+    cwd: &Path,
 ) -> Result<ClaudeResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut cmd = Command::new("claude");
-    cmd.arg("-p")
+    cmd.current_dir(cwd)
+        .arg("-p")
         .arg(prompt)
         .arg("--output-format")
         .arg("stream-json")
@@ -67,7 +70,7 @@ pub async fn run_turn(
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    debug!(?resume_session_id, "spawning claude");
+    debug!(?resume_session_id, cwd = %cwd.display(), "spawning claude");
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take().ok_or("no stdout from claude")?;
     let mut reader = BufReader::new(stdout).lines();

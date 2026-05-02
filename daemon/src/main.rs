@@ -1,4 +1,5 @@
 mod claude;
+mod projects;
 mod session;
 
 use slack_morphism::prelude::*;
@@ -6,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
+use crate::projects::ProjectsRegistry;
 use crate::session::{now_unix, SessionStore};
 
 const KEYRING_SERVICE: &str = "slack-sessions";
@@ -115,17 +117,72 @@ async fn handle_dm(
     let entry_arc = store.get_or_create(&thread_ts.0).await;
     let mut entry = entry_arc.lock().await;
 
+    let is_first_turn = entry.cwd.is_none();
+
+    // Resolve prompt + cwd via either a magic command (`!start ...` etc.) or the default path.
+    let (prompt_text, resolved_cwd) = if let Some(parsed) = parse_magic_command(&text) {
+        match parsed {
+            Ok(cmd) => match execute_magic_command(cmd, is_first_turn) {
+                MagicResult::ReplyOnly(reply) => {
+                    post_reply(&client, &channel, &thread_ts, &reply).await?;
+                    return Ok(());
+                }
+                MagicResult::Reject(hint) => {
+                    post_reply(&client, &channel, &thread_ts, &hint).await?;
+                    return Ok(());
+                }
+                MagicResult::BindOnly { cwd } => {
+                    let cwd_str = cwd.to_string_lossy().to_string();
+                    post_reply(
+                        &client,
+                        &channel,
+                        &thread_ts,
+                        &format!(
+                            "_Bound this thread to `{}`. Send your prompt._",
+                            cwd.display()
+                        ),
+                    )
+                    .await?;
+                    entry.cwd = Some(cwd_str);
+                    entry.last_active_unix = now_unix();
+                    drop(entry);
+                    store.persist().await.ok();
+                    return Ok(());
+                }
+                MagicResult::BindAndRun { cwd, prompt } => (prompt, cwd),
+            },
+            Err(hint) => {
+                post_reply(&client, &channel, &thread_ts, &format!("_{}_", hint)).await?;
+                return Ok(());
+            }
+        }
+    } else if is_first_turn {
+        (text.clone(), default_cwd())
+    } else {
+        let cwd = entry
+            .cwd
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(default_cwd);
+        (text.clone(), cwd)
+    };
+
     let placeholder_ts = post_placeholder(&client, &channel, &thread_ts).await?;
 
-    let claude_result =
-        match crate::claude::run_turn(&text, entry.claude_session_id.as_deref()).await {
-            Ok(r) => r,
-            Err(e) => {
-                let err_text = format!("_claude failed:_ {}", e);
-                let _ = update_message(&client, &channel, &placeholder_ts, &err_text).await;
-                return Err(e);
-            }
-        };
+    let claude_result = match crate::claude::run_turn(
+        &prompt_text,
+        entry.claude_session_id.as_deref(),
+        &resolved_cwd,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let err_text = format!("_claude failed:_ {}", e);
+            let _ = update_message(&client, &channel, &placeholder_ts, &err_text).await;
+            return Err(e);
+        }
+    };
 
     let display_text = truncate_for_slack(&claude_result.text);
     update_message(&client, &channel, &placeholder_ts, &display_text).await?;
@@ -133,12 +190,247 @@ async fn handle_dm(
     if entry.claude_session_id.is_none() {
         entry.claude_session_id = claude_result.session_id;
     }
+    if is_first_turn {
+        entry.cwd = Some(resolved_cwd.to_string_lossy().to_string());
+    }
     entry.last_active_unix = now_unix();
     drop(entry);
 
     if let Err(e) = store.persist().await {
         warn!(error = %e, "failed to persist session store");
     }
+    Ok(())
+}
+
+enum MagicCommand<'a> {
+    List,
+    Help,
+    Add { name: &'a str, path: &'a str },
+    Remove { name: &'a str },
+    SetDefault { path: &'a str },
+    Start { name: &'a str, message: &'a str },
+}
+
+enum MagicResult {
+    /// Post the reply text to the thread and stop (no claude spawn).
+    ReplyOnly(String),
+    /// Bind the thread to a project but don't run claude on this turn.
+    BindOnly { cwd: PathBuf },
+    /// Bind the thread and run claude with the given prompt.
+    BindAndRun { cwd: PathBuf, prompt: String },
+    /// Post a hint and stop (e.g. unknown project, wrong turn).
+    Reject(String),
+}
+
+/// Returns:
+/// - `None` if the text is not a magic command (no `!` prefix or unknown keyword).
+/// - `Some(Ok(cmd))` for a valid command.
+/// - `Some(Err(hint))` for a recognized keyword used incorrectly.
+fn parse_magic_command(text: &str) -> Option<Result<MagicCommand<'_>, String>> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix('!')?;
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let cmd = parts.next()?.trim();
+    let args = parts.next().unwrap_or("").trim();
+    match cmd {
+        "list" => Some(Ok(MagicCommand::List)),
+        "help" => Some(Ok(MagicCommand::Help)),
+        "add" => {
+            let mut split = args.splitn(2, char::is_whitespace);
+            let name = split.next().unwrap_or("").trim();
+            let path = split.next().unwrap_or("").trim();
+            if name.is_empty() || path.is_empty() {
+                Some(Err("usage: `!add <name> <path>`".into()))
+            } else {
+                Some(Ok(MagicCommand::Add { name, path }))
+            }
+        }
+        "remove" | "rm" => {
+            if args.is_empty() {
+                Some(Err("usage: `!remove <name>`".into()))
+            } else {
+                Some(Ok(MagicCommand::Remove { name: args }))
+            }
+        }
+        "set-default" => {
+            if args.is_empty() {
+                Some(Err("usage: `!set-default <path>`".into()))
+            } else {
+                Some(Ok(MagicCommand::SetDefault { path: args }))
+            }
+        }
+        "start" => {
+            let mut split = args.splitn(2, char::is_whitespace);
+            let name = split.next().unwrap_or("").trim();
+            let message = split.next().unwrap_or("").trim();
+            if name.is_empty() {
+                Some(Err("usage: `!start <project> [<message>]`".into()))
+            } else {
+                Some(Ok(MagicCommand::Start { name, message }))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn execute_magic_command(cmd: MagicCommand<'_>, is_first_turn: bool) -> MagicResult {
+    match cmd {
+        MagicCommand::List => MagicResult::ReplyOnly(format_project_list()),
+        MagicCommand::Help => MagicResult::ReplyOnly(format_help()),
+        MagicCommand::Add { name, path } => {
+            MagicResult::ReplyOnly(add_project_via_command(name, path))
+        }
+        MagicCommand::Remove { name } => MagicResult::ReplyOnly(remove_project_via_command(name)),
+        MagicCommand::SetDefault { path } => MagicResult::ReplyOnly(set_default_via_command(path)),
+        MagicCommand::Start { name, message } => {
+            if !is_first_turn {
+                return MagicResult::Reject(
+                    "_This thread is already bound. Reply normally, or DM a fresh top-level message to switch projects._".into(),
+                );
+            }
+            let registry = ProjectsRegistry::load().unwrap_or_default();
+            let cwd = match registry.lookup(name) {
+                Some(p) => p,
+                None => {
+                    return MagicResult::Reject(format!(
+                        "_No project named `{}`. Try `!list` to see registered projects._",
+                        name
+                    ))
+                }
+            };
+            if message.is_empty() {
+                MagicResult::BindOnly { cwd }
+            } else {
+                MagicResult::BindAndRun {
+                    cwd,
+                    prompt: message.to_string(),
+                }
+            }
+        }
+    }
+}
+
+fn add_project_via_command(name: &str, path_str: &str) -> String {
+    if let Err(e) = ProjectsRegistry::validate_name(name) {
+        return format!("_Invalid name:_ {}", e);
+    }
+    let canonical = match crate::projects::canonicalize_dir(path_str) {
+        Ok(p) => p,
+        Err(e) => return format!("_{}_", e),
+    };
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let mut reg = match ProjectsRegistry::load() {
+        Ok(r) => r,
+        Err(e) => return format!("_failed to load registry: {}_", e),
+    };
+    let prior = reg
+        .projects
+        .insert(name.to_string(), canonical_str.clone());
+    if let Err(e) = reg.save() {
+        return format!("_failed to save registry: {}_", e);
+    }
+    if prior.is_some() {
+        format!("[ok] updated `{}` → `{}`", name, canonical_str)
+    } else {
+        format!(
+            "[ok] added `{}` → `{}`\nUse `!{}` on a *new* thread to start a session there.",
+            name, canonical_str, name
+        )
+    }
+}
+
+fn remove_project_via_command(name: &str) -> String {
+    let mut reg = match ProjectsRegistry::load() {
+        Ok(r) => r,
+        Err(e) => return format!("_failed to load registry: {}_", e),
+    };
+    if reg.projects.remove(name).is_none() {
+        return format!("_no project named `{}`_", name);
+    }
+    if let Err(e) = reg.save() {
+        return format!("_failed to save registry: {}_", e);
+    }
+    format!("[ok] removed `{}`", name)
+}
+
+fn set_default_via_command(path_str: &str) -> String {
+    let canonical = match crate::projects::canonicalize_dir(path_str) {
+        Ok(p) => p,
+        Err(e) => return format!("_{}_", e),
+    };
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let mut reg = match ProjectsRegistry::load() {
+        Ok(r) => r,
+        Err(e) => return format!("_failed to load registry: {}_", e),
+    };
+    reg.default_dir = Some(canonical_str.clone());
+    if let Err(e) = reg.save() {
+        return format!("_failed to save registry: {}_", e);
+    }
+    format!("[ok] default working directory: `{}`", canonical_str)
+}
+
+fn default_cwd() -> PathBuf {
+    ProjectsRegistry::load()
+        .map(|r| r.resolved_default())
+        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")))
+}
+
+fn format_project_list() -> String {
+    let registry = ProjectsRegistry::load().unwrap_or_default();
+    let mut out = String::new();
+    out.push_str("*slack-sessions — project registry*\n\n");
+    out.push_str(&format!(
+        "Default working directory: `{}`\n",
+        registry.resolved_default().display()
+    ));
+    if registry.default_dir.is_none() {
+        out.push_str("_(using $HOME — set with `slack-sessions project set-default <path>`)_\n");
+    }
+    out.push('\n');
+    if registry.projects.is_empty() {
+        out.push_str("_No registered projects._\n");
+        out.push_str("Add one in your terminal: `slack-sessions project add <name> <path>`\n");
+    } else {
+        out.push_str("Registered projects:\n");
+        for (name, path) in &registry.projects {
+            out.push_str(&format!("• `!{}` → `{}`\n", name, path));
+        }
+        out.push('\n');
+        out.push_str("Prefix the *first* message of a new thread with `!<name>` to start the session in that project.\n");
+    }
+    out
+}
+
+fn format_help() -> String {
+    let mut out = String::new();
+    out.push_str("*slack-sessions — help*\n\n");
+    out.push_str("• Top-level DM → starts a new Claude session in the default working directory.\n");
+    out.push_str("• Reply in the thread → resumes that session.\n");
+    out.push_str("• `!start <project> [<message>]` on the *first* message of a thread → bind that thread to a registered project's directory.\n");
+    out.push_str("\n*Registry commands* (any time, no Claude spawn):\n");
+    out.push_str("• `!list` — show registered projects + default working directory\n");
+    out.push_str("• `!add <name> <path>` — register a project (path can use `~`)\n");
+    out.push_str("• `!remove <name>` (or `!rm <name>`) — remove a registered project\n");
+    out.push_str("• `!set-default <path>` — set default working directory for unprefixed DMs\n");
+    out.push_str("• `!help` — show this message\n");
+    out
+}
+
+async fn post_reply(
+    client: &SlackHyperClient,
+    channel: &SlackChannelId,
+    thread_ts: &SlackTs,
+    text: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
+    let session = client.open_session(token);
+    let req = SlackApiChatPostMessageRequest::new(
+        channel.clone(),
+        SlackMessageContent::new().with_text(text.to_string()),
+    )
+    .with_thread_ts(thread_ts.clone());
+    session.chat_post_message(&req).await?;
     Ok(())
 }
 

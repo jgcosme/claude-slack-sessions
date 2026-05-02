@@ -9,6 +9,8 @@ use tokio::sync::Mutex;
 pub struct ThreadEntry {
     pub claude_session_id: Option<String>,
     pub last_active_unix: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -48,6 +50,7 @@ impl SessionStore {
                 Arc::new(Mutex::new(ThreadEntry {
                     claude_session_id: None,
                     last_active_unix: now_unix(),
+                    cwd: None,
                 }))
             })
             .clone()
