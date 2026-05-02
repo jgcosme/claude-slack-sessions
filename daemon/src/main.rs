@@ -1,12 +1,21 @@
+mod claude;
+mod session;
+
 use slack_morphism::prelude::*;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
+
+use crate::session::{now_unix, SessionStore};
 
 const KEYRING_SERVICE: &str = "slack-sessions";
 const KEYRING_APP_TOKEN_ACCOUNT: &str = "app-token";
 const KEYRING_BOT_TOKEN_ACCOUNT: &str = "bot-token";
+const STATE_PATH: &str = ".runtime/sessions.json";
+const SLACK_MAX_TEXT: usize = 38_000;
 
 static BOT_TOKEN: OnceLock<SlackApiToken> = OnceLock::new();
+static SESSION_STORE: OnceLock<Arc<SessionStore>> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -22,6 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app_token: SlackApiToken = SlackApiToken::new(app_token_str.into());
     let bot_token: SlackApiToken = SlackApiToken::new(bot_token_str.into());
     let _ = BOT_TOKEN.set(bot_token);
+
+    let store = Arc::new(SessionStore::load(PathBuf::from(STATE_PATH)).await?);
+    info!(path = STATE_PATH, "session store loaded");
+    let _ = SESSION_STORE.set(store);
 
     let client = Arc::new(SlackClient::new(SlackClientHyperConnector::new()?));
 
@@ -59,13 +72,7 @@ async fn on_push_event(
         .as_ref()
         .map(|c| c.0.as_str() == "im")
         .unwrap_or(false);
-    if !is_im {
-        return Ok(());
-    }
-    if msg.sender.bot_id.is_some() {
-        return Ok(());
-    }
-    if msg.subtype.is_some() {
+    if !is_im || msg.sender.bot_id.is_some() || msg.subtype.is_some() {
         return Ok(());
     }
 
@@ -86,28 +93,100 @@ async fn on_push_event(
         "DM received"
     );
 
-    if let Err(e) = post_echo_reply(&client, &channel, &thread_ts, &text).await {
-        warn!(error = %e, "echo reply failed");
-    }
+    tokio::spawn(async move {
+        if let Err(e) = handle_dm(client, channel, thread_ts, text).await {
+            warn!(error = %e, "DM handling failed");
+        }
+    });
 
     Ok(())
 }
 
-async fn post_echo_reply(
+async fn handle_dm(
+    client: Arc<SlackHyperClient>,
+    channel: SlackChannelId,
+    thread_ts: SlackTs,
+    text: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let store = SESSION_STORE
+        .get()
+        .ok_or("session store not initialized")?
+        .clone();
+    let entry_arc = store.get_or_create(&thread_ts.0).await;
+    let mut entry = entry_arc.lock().await;
+
+    let placeholder_ts = post_placeholder(&client, &channel, &thread_ts).await?;
+
+    let claude_result =
+        match crate::claude::run_turn(&text, entry.claude_session_id.as_deref()).await {
+            Ok(r) => r,
+            Err(e) => {
+                let err_text = format!("_claude failed:_ {}", e);
+                let _ = update_message(&client, &channel, &placeholder_ts, &err_text).await;
+                return Err(e);
+            }
+        };
+
+    let display_text = truncate_for_slack(&claude_result.text);
+    update_message(&client, &channel, &placeholder_ts, &display_text).await?;
+
+    if entry.claude_session_id.is_none() {
+        entry.claude_session_id = claude_result.session_id;
+    }
+    entry.last_active_unix = now_unix();
+    drop(entry);
+
+    if let Err(e) = store.persist().await {
+        warn!(error = %e, "failed to persist session store");
+    }
+    Ok(())
+}
+
+async fn post_placeholder(
     client: &SlackHyperClient,
     channel: &SlackChannelId,
     thread_ts: &SlackTs,
+) -> Result<SlackTs, Box<dyn std::error::Error + Send + Sync>> {
+    let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
+    let session = client.open_session(token);
+    let req = SlackApiChatPostMessageRequest::new(
+        channel.clone(),
+        SlackMessageContent::new().with_text("_thinking..._".to_string()),
+    )
+    .with_thread_ts(thread_ts.clone());
+    let resp = session.chat_post_message(&req).await?;
+    Ok(resp.ts)
+}
+
+async fn update_message(
+    client: &SlackHyperClient,
+    channel: &SlackChannelId,
+    ts: &SlackTs,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
     let session = client.open_session(token);
-    let request = SlackApiChatPostMessageRequest::new(
+    let req = SlackApiChatUpdateRequest::new(
         channel.clone(),
-        SlackMessageContent::new().with_text(format!("echo: {}", text)),
-    )
-    .with_thread_ts(thread_ts.clone());
-    session.chat_post_message(&request).await?;
+        SlackMessageContent::new().with_text(text.to_string()),
+        ts.clone(),
+    );
+    session.chat_update(&req).await?;
     Ok(())
+}
+
+fn truncate_for_slack(s: &str) -> String {
+    if s.len() <= SLACK_MAX_TEXT {
+        return s.to_string();
+    }
+    let mut end = SLACK_MAX_TEXT;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut t = String::with_capacity(end + 32);
+    t.push_str(&s[..end]);
+    t.push_str("\n\n_[output truncated]_");
+    t
 }
 
 fn on_error(

@@ -1652,6 +1652,8 @@ name = "slack-sessionsd"
 version = "0.0.1"
 dependencies = [
  "keyring",
+ "serde",
+ "serde_json",
  "slack-morphism",
  "tokio",
  "tracing",
