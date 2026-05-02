@@ -1,0 +1,12 @@
+{
+  "name": "slack-sessions",
+  "description": "Drive Claude Code from Slack. Each top-level message in DM spawns a fresh Claude session; in-thread replies resume that session via `claude --resume`. One thread = one transcript = no context rot across unrelated tasks.",
+  "version": "0.0.1",
+  "author": {
+    "name": "Jeff Cosme",
+    "email": "jeff@thinkingmachin.es"
+  },
+  "homepage": "https://github.com/jgcosme/claude-slack-sessions",
+  "repository": "https://github.com/jgcosme/claude-slack-sessions",
+  "license": "MIT"
+}

@@ -1,0 +1,15 @@
+# OS noise
+.DS_Store
+.trash/
+
+# Editor state
+.vscode/
+.idea/
+
+# Local-only logs / runtime state
+*.log
+.runtime/
+
+# Secrets
+.env
+secrets.env
