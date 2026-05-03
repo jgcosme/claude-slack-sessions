@@ -5,6 +5,26 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
+const HEADER: &str = r#"// slack-sessions — thread state
+//
+// Per-thread session state, keyed by Slack thread_ts. Each entry holds:
+//   • claude_session_id: passed to `claude --resume` on subsequent turns
+//     so the model resumes the same conversation. Captured from claude's
+//     stream-json output on the first turn.
+//   • cwd: working directory the thread is bound to. Set on first turn
+//     based on `!start <project>` / default registry; reused on replies.
+//   • last_active_unix: epoch seconds of the most recent turn.
+//
+// Mutated by the daemon on every DM/mention; manual edits are safe but
+// will likely be overwritten quickly. Removing an entry effectively
+// starts a new claude session the next time someone posts in that
+// thread (since claude_session_id will be missing). Deleting the file
+// forgets all bound threads but does not affect projects.json or
+// allowlist.json.
+//
+// Comments above are restored automatically on each write.
+"#;
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ThreadEntry {
     pub claude_session_id: Option<String>,
@@ -28,7 +48,7 @@ impl SessionStore {
         let exists = tokio::fs::try_exists(&state_path).await.unwrap_or(false);
         let threads = if exists {
             let raw = tokio::fs::read_to_string(&state_path).await?;
-            let file: StoreFile = serde_json::from_str(&raw)
+            let file: StoreFile = json5::from_str(&raw)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             file.sessions
                 .into_iter()
@@ -66,12 +86,13 @@ impl SessionStore {
             }
             file
         };
-        let raw = serde_json::to_string_pretty(&snapshot)
+        let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if let Some(parent) = self.state_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&self.state_path, raw).await?;
+        let combined = format!("{}\n{}\n", HEADER.trim_end(), json);
+        tokio::fs::write(&self.state_path, combined).await?;
         Ok(())
     }
 }

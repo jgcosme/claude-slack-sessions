@@ -1,4 +1,5 @@
 mod allowlist;
+mod config;
 mod projects;
 mod service;
 

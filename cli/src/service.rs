@@ -126,6 +126,11 @@ pub fn uninstall(purge: bool) -> Result<()> {
             std::fs::remove_dir_all(&log_dir).ok();
             println!("[ok] removed logs at {}", log_dir.display());
         }
+        let config_dir = crate::config::config_dir().ok();
+        if let Some(dir) = config_dir.filter(|d| d.exists()) {
+            std::fs::remove_dir_all(&dir).ok();
+            println!("[ok] removed config at {}", dir.display());
+        }
         println!(
             "     (keyring tokens preserved; clear manually if desired:\n      security delete-generic-password -s slack-sessions -a app-token\n      security delete-generic-password -s slack-sessions -a bot-token)"
         );

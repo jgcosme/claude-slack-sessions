@@ -1,5 +1,6 @@
 mod allowlist;
 mod claude;
+mod config;
 mod projects;
 mod session;
 
@@ -778,8 +779,7 @@ fn spawn_caffeinate() {
 }
 
 fn sessions_state_path() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let dir = dirs::config_dir().ok_or("no config dir for this platform")?;
-    Ok(dir.join("slack-sessions").join("sessions.json"))
+    Ok(crate::config::config_dir()?.join("sessions.json"))
 }
 
 fn read_secret(
