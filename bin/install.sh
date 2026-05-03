@@ -69,12 +69,11 @@ OS=$(uname -s)
 ARCH=$(uname -m)
 case "$OS-$ARCH" in
   Darwin-arm64)        PLATFORM="aarch64-apple-darwin" ;;
-  Darwin-x86_64)       PLATFORM="x86_64-apple-darwin" ;;
   Linux-x86_64)        PLATFORM="x86_64-unknown-linux-gnu" ;;
   *)
     echo "[install] no prebuilt for $OS-$ARCH; attempting build from source" >&2
     if build_from_source; then exit 0; fi
-    echo "[install] prebuilt tiers: Darwin-arm64, Darwin-x86_64, Linux-x86_64" >&2
+    echo "[install] prebuilt tiers: Darwin-arm64, Linux-x86_64" >&2
     echo "[install] for other platforms, install Rust (https://rustup.rs) and re-run" >&2
     exit 1
     ;;
