@@ -1,3 +1,4 @@
+mod allowlist;
 mod claude;
 mod projects;
 mod session;
@@ -7,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
+use crate::allowlist::Allowlist;
+use crate::claude::ToolMode;
 use crate::projects::ProjectsRegistry;
 use crate::session::{now_unix, SessionStore};
 
@@ -88,8 +91,20 @@ async fn on_push_event(
     };
     let ts = msg.origin.ts.clone();
     let thread_ts = msg.origin.thread_ts.clone().unwrap_or_else(|| ts.clone());
+    let user_id = msg
+        .sender
+        .user
+        .as_ref()
+        .map(|u| u.0.clone())
+        .unwrap_or_default();
+
+    let allowlist = Allowlist::load().unwrap_or_default();
+    let is_allowlisted = allowlist.contains(&user_id);
 
     info!(
+        user = %user_id,
+        allowlisted = is_allowlisted,
+        tier = if is_allowlisted { "full" } else { "no-tools" },
         channel = %channel.0,
         ts = %ts.0,
         thread_ts = %thread_ts.0,
@@ -97,12 +112,46 @@ async fn on_push_event(
         "DM received"
     );
 
-    tokio::spawn(async move {
-        if let Err(e) = handle_dm(client, channel, thread_ts, text).await {
-            warn!(error = %e, "DM handling failed");
-        }
-    });
+    if is_allowlisted {
+        tokio::spawn(async move {
+            if let Err(e) = handle_dm(client, channel, thread_ts, text).await {
+                warn!(error = %e, "DM handling failed");
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = handle_no_tools_reply(client, channel, thread_ts, text).await {
+                warn!(error = %e, "no-tools reply failed");
+            }
+        });
+    }
 
+    Ok(())
+}
+
+/// Handle a DM from a non-allowlisted Slack user. Spawns claude with
+/// `--tools ""` (no filesystem, no Bash, no MCP, no network) and posts a
+/// one-shot reply. No session resume, no thread state — every message is
+/// answered fresh.
+async fn handle_no_tools_reply(
+    client: Arc<SlackHyperClient>,
+    channel: SlackChannelId,
+    thread_ts: SlackTs,
+    text: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let placeholder_ts = post_placeholder(&client, &channel, &thread_ts).await?;
+    let cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    let result =
+        match crate::claude::run_turn(&text, None, &cwd, ToolMode::None).await {
+            Ok(r) => r,
+            Err(e) => {
+                let err_text = format!("_claude failed:_ {}", e);
+                let _ = update_message(&client, &channel, &placeholder_ts, &err_text).await;
+                return Err(e);
+            }
+        };
+    let display_text = truncate_for_slack(&result.text);
+    update_message(&client, &channel, &placeholder_ts, &display_text).await?;
     Ok(())
 }
 
@@ -175,6 +224,7 @@ async fn handle_dm(
         &prompt_text,
         entry.claude_session_id.as_deref(),
         &resolved_cwd,
+        ToolMode::Full,
     )
     .await
     {
@@ -211,6 +261,9 @@ enum MagicCommand<'a> {
     Remove { name: &'a str },
     SetDefault { path: &'a str },
     Start { name: &'a str, message: &'a str },
+    AllowAdd { user_id: &'a str },
+    AllowList,
+    AllowRemove { user_id: &'a str },
 }
 
 enum MagicResult {
@@ -271,6 +324,29 @@ fn parse_magic_command(text: &str) -> Option<Result<MagicCommand<'_>, String>> {
                 Some(Ok(MagicCommand::Start { name, message }))
             }
         }
+        "allow" => {
+            let mut split = args.splitn(2, char::is_whitespace);
+            let sub = split.next().unwrap_or("").trim();
+            let arg = split.next().unwrap_or("").trim();
+            match sub {
+                "add" => {
+                    if arg.is_empty() {
+                        Some(Err("usage: `!allow add <user-id>`".into()))
+                    } else {
+                        Some(Ok(MagicCommand::AllowAdd { user_id: arg }))
+                    }
+                }
+                "list" => Some(Ok(MagicCommand::AllowList)),
+                "remove" | "rm" => {
+                    if arg.is_empty() {
+                        Some(Err("usage: `!allow remove <user-id>`".into()))
+                    } else {
+                        Some(Ok(MagicCommand::AllowRemove { user_id: arg }))
+                    }
+                }
+                _ => Some(Err("usage: `!allow add|list|remove <user-id>`".into())),
+            }
+        }
         _ => None,
     }
 }
@@ -284,6 +360,13 @@ fn execute_magic_command(cmd: MagicCommand<'_>, is_first_turn: bool) -> MagicRes
         }
         MagicCommand::Remove { name } => MagicResult::ReplyOnly(remove_project_via_command(name)),
         MagicCommand::SetDefault { path } => MagicResult::ReplyOnly(set_default_via_command(path)),
+        MagicCommand::AllowAdd { user_id } => {
+            MagicResult::ReplyOnly(allow_add_via_command(user_id))
+        }
+        MagicCommand::AllowList => MagicResult::ReplyOnly(format_allowlist()),
+        MagicCommand::AllowRemove { user_id } => {
+            MagicResult::ReplyOnly(allow_remove_via_command(user_id))
+        }
         MagicCommand::Start { name, message } => {
             if !is_first_turn {
                 return MagicResult::Reject(
@@ -355,6 +438,58 @@ fn remove_project_via_command(name: &str) -> String {
     format!("[ok] removed `{}`", name)
 }
 
+fn allow_add_via_command(user_id: &str) -> String {
+    if let Err(e) = Allowlist::validate_user_id(user_id) {
+        return format!("_invalid user id: {}_", e);
+    }
+    let mut list = match Allowlist::load() {
+        Ok(l) => l,
+        Err(e) => return format!("_failed to load allowlist: {}_", e),
+    };
+    let inserted = list.slack_user_ids.insert(user_id.to_string());
+    if let Err(e) = list.save() {
+        return format!("_failed to save allowlist: {}_", e);
+    }
+    if inserted {
+        format!("[ok] allowlisted `{}`", user_id)
+    } else {
+        format!("[--] `{}` is already on the allowlist", user_id)
+    }
+}
+
+fn allow_remove_via_command(user_id: &str) -> String {
+    let mut list = match Allowlist::load() {
+        Ok(l) => l,
+        Err(e) => return format!("_failed to load allowlist: {}_", e),
+    };
+    if !list.slack_user_ids.remove(user_id) {
+        return format!("_`{}` is not on the allowlist_", user_id);
+    }
+    if let Err(e) = list.save() {
+        return format!("_failed to save allowlist: {}_", e);
+    }
+    format!("[ok] removed `{}`", user_id)
+}
+
+fn format_allowlist() -> String {
+    let list = Allowlist::load().unwrap_or_default();
+    let mut out = String::new();
+    out.push_str("*slack-sessions — allowlist*\n\n");
+    if list.slack_user_ids.is_empty() {
+        out.push_str("_The allowlist is empty._ Bot will ignore everyone except via direct CLI access.\n");
+    } else {
+        out.push_str(&format!(
+            "Allowlisted Slack user IDs ({}):\n",
+            list.slack_user_ids.len()
+        ));
+        for id in &list.slack_user_ids {
+            out.push_str(&format!("• `{}`\n", id));
+        }
+    }
+    out.push_str("\n_Allowlisted users get full tools (bypassPermissions). Everyone else gets a pure-chat reply with no filesystem or network access._\n");
+    out
+}
+
 fn set_default_via_command(path_str: &str) -> String {
     let canonical = match crate::projects::canonicalize_dir(path_str) {
         Ok(p) => p,
@@ -410,12 +545,16 @@ fn format_help() -> String {
     out.push_str("• Top-level DM → starts a new Claude session in the default working directory.\n");
     out.push_str("• Reply in the thread → resumes that session.\n");
     out.push_str("• `!start <project> [<message>]` on the *first* message of a thread → bind that thread to a registered project's directory.\n");
-    out.push_str("\n*Registry commands* (any time, no Claude spawn):\n");
+    out.push_str("\n*Registry commands* (allowlisted senders only, no Claude spawn):\n");
     out.push_str("• `!list` — show registered projects + default working directory\n");
     out.push_str("• `!add <name> <path>` — register a project (path can use `~`)\n");
     out.push_str("• `!remove <name>` (or `!rm <name>`) — remove a registered project\n");
     out.push_str("• `!set-default <path>` — set default working directory for unprefixed DMs\n");
-    out.push_str("• `!help` — show this message\n");
+    out.push_str("\n*Allowlist commands* (allowlisted senders only):\n");
+    out.push_str("• `!allow list` — show allowlisted Slack user IDs\n");
+    out.push_str("• `!allow add <user-id>` — grant a Slack user full-tools access\n");
+    out.push_str("• `!allow remove <user-id>` — revoke access\n");
+    out.push_str("\n• `!help` — show this message\n");
     out
 }
 

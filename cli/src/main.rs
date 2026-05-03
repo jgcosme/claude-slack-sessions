@@ -1,3 +1,4 @@
+mod allowlist;
 mod projects;
 mod service;
 
@@ -6,6 +7,7 @@ use clap::{Parser, Subcommand};
 use keyring::Entry;
 use std::path::PathBuf;
 
+use crate::allowlist::Allowlist;
 use crate::projects::ProjectsRegistry;
 
 const SERVICE: &str = "slack-sessions";
@@ -47,6 +49,21 @@ enum Command {
         #[arg(long)]
         copy: bool,
     },
+    /// Manage the allowlist of Slack user IDs that can drive full sessions
+    Allow {
+        #[command(subcommand)]
+        action: AllowAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AllowAction {
+    /// Add a Slack user ID to the allowlist (find your ID via Slack profile → ⋮ → Copy member ID)
+    Add { user_id: String },
+    /// Show all allowlisted user IDs
+    List,
+    /// Remove a Slack user ID from the allowlist
+    Remove { user_id: String },
 }
 
 #[derive(Subcommand)]
@@ -123,6 +140,11 @@ fn main() -> Result<()> {
             ServiceAction::Logs { follow, lines } => service::logs(follow, lines),
         },
         Command::Manifest { copy } => manifest_command(copy),
+        Command::Allow { action } => match action {
+            AllowAction::Add { user_id } => allow_add(&user_id),
+            AllowAction::List => allow_list(),
+            AllowAction::Remove { user_id } => allow_remove(&user_id),
+        },
     }
 }
 
@@ -204,6 +226,44 @@ fn setup_check() -> Result<()> {
     if !all_present {
         return Err(anyhow!("missing tokens — run `slack-sessions setup`"));
     }
+    Ok(())
+}
+
+fn allow_add(user_id: &str) -> Result<()> {
+    Allowlist::validate_user_id(user_id).map_err(|e| anyhow!(e))?;
+    let mut list = Allowlist::load().context("failed to load allowlist")?;
+    let inserted = list.slack_user_ids.insert(user_id.to_string());
+    list.save().context("failed to save allowlist")?;
+    if inserted {
+        println!("[ok] allowlisted {}", user_id);
+    } else {
+        println!("[--] {} already on allowlist", user_id);
+    }
+    Ok(())
+}
+
+fn allow_list() -> Result<()> {
+    let list = Allowlist::load().context("failed to load allowlist")?;
+    if list.slack_user_ids.is_empty() {
+        println!("[--] allowlist is empty — bot ignores all senders");
+        println!("     bootstrap with: slack-sessions allow add <your-slack-user-id>");
+        println!("     find your ID: Slack desktop → click your avatar → Profile → ⋮ → Copy member ID");
+        return Ok(());
+    }
+    println!("allowlisted Slack user IDs ({}):", list.slack_user_ids.len());
+    for id in &list.slack_user_ids {
+        println!("  {}", id);
+    }
+    Ok(())
+}
+
+fn allow_remove(user_id: &str) -> Result<()> {
+    let mut list = Allowlist::load().context("failed to load allowlist")?;
+    if !list.slack_user_ids.remove(user_id) {
+        return Err(anyhow!("{} was not on the allowlist", user_id));
+    }
+    list.save().context("failed to save allowlist")?;
+    println!("[ok] removed {}", user_id);
     Ok(())
 }
 
