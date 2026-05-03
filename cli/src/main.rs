@@ -41,6 +41,12 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Print the Slack app manifest YAML (paste into Slack → Create App → From a manifest)
+    Manifest {
+        /// Also copy to the system clipboard via `pbcopy` (macOS only)
+        #[arg(long)]
+        copy: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -116,6 +122,7 @@ fn main() -> Result<()> {
             ServiceAction::Uninstall { purge } => service::uninstall(purge),
             ServiceAction::Logs { follow, lines } => service::logs(follow, lines),
         },
+        Command::Manifest { copy } => manifest_command(copy),
     }
 }
 
@@ -196,6 +203,35 @@ fn setup_check() -> Result<()> {
     }
     if !all_present {
         return Err(anyhow!("missing tokens — run `slack-sessions setup`"));
+    }
+    Ok(())
+}
+
+const MANIFEST_YAML: &str = include_str!("../templates/slack-app-manifest.yaml");
+
+fn manifest_command(copy: bool) -> Result<()> {
+    print!("{}", MANIFEST_YAML);
+    if copy {
+        use std::io::Write;
+        let mut child = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to spawn pbcopy (macOS only)")?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(MANIFEST_YAML.as_bytes())
+                .context("failed to write to pbcopy stdin")?;
+        }
+        let status = child.wait().context("pbcopy failed")?;
+        if !status.success() {
+            return Err(anyhow!("pbcopy exited with {}", status));
+        }
+        eprintln!();
+        eprintln!("[ok] manifest copied to clipboard");
+        eprintln!("     1. open https://api.slack.com/apps");
+        eprintln!("     2. click \"Create New App\" → \"From a manifest\"");
+        eprintln!("     3. pick your workspace, paste the YAML, confirm");
+        eprintln!("     4. install to workspace, then run `slack-sessions setup`");
     }
     Ok(())
 }
