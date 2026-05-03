@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 slack-morphism = { version = "2.20", features = ["hyper"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "io-util", "fs", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "io-util", "fs", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }

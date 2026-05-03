@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +67,7 @@ pub async fn run_turn(
     resume_session_id: Option<&str>,
     cwd: &Path,
     tool_mode: ToolMode,
+    chunk_tx: Option<mpsc::Sender<String>>,
 ) -> Result<ClaudeResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut cmd = Command::new("claude");
     cmd.current_dir(cwd)
@@ -115,6 +117,9 @@ pub async fn run_turn(
                 for block in w.message.content {
                     if let ContentBlock::Text { text: t } = block {
                         text.push_str(&t);
+                        if let Some(tx) = chunk_tx.as_ref() {
+                            let _ = tx.send(t).await;
+                        }
                     }
                 }
             }

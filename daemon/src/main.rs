@@ -18,6 +18,11 @@ const KEYRING_SERVICE: &str = "slack-sessions";
 const KEYRING_APP_TOKEN_ACCOUNT: &str = "app-token";
 const KEYRING_BOT_TOKEN_ACCOUNT: &str = "bot-token";
 const SLACK_MAX_TEXT: usize = 38_000;
+/// Wall-clock threshold above which we post a separate `<@user> _done_` reply
+/// in the thread after the final edit. `chat.update` does not fire mention
+/// notifications, so a fresh `chat.postMessage` is required to actually ping.
+/// Trivial replies (under this threshold) stay clean — no extra message.
+const PING_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(30);
 
 static BOT_TOKEN: OnceLock<SlackApiToken> = OnceLock::new();
 static SESSION_STORE: OnceLock<Arc<SessionStore>> = OnceLock::new();
@@ -124,14 +129,14 @@ async fn on_message_event(
     if is_allowlisted {
         tokio::spawn(async move {
             if let Err(e) =
-                handle_full_session(client, channel, thread_ts, text, Surface::Dm).await
+                handle_full_session(client, channel, thread_ts, text, user_id, Surface::Dm).await
             {
                 warn!(error = %e, "DM handling failed");
             }
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = handle_no_tools_reply(client, channel, thread_ts, text).await {
+            if let Err(e) = handle_no_tools_reply(client, channel, thread_ts, text, user_id).await {
                 warn!(error = %e, "no-tools reply failed");
             }
         });
@@ -168,15 +173,22 @@ async fn on_mention_event(
 
     if is_allowlisted {
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_full_session(client, channel, thread_ts, text, Surface::ChannelMention).await
+            if let Err(e) = handle_full_session(
+                client,
+                channel,
+                thread_ts,
+                text,
+                user_id,
+                Surface::ChannelMention,
+            )
+            .await
             {
                 warn!(error = %e, "channel mention handling failed");
             }
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = handle_no_tools_reply(client, channel, thread_ts, text).await {
+            if let Err(e) = handle_no_tools_reply(client, channel, thread_ts, text, user_id).await {
                 warn!(error = %e, "no-tools reply failed");
             }
         });
@@ -207,20 +219,32 @@ async fn handle_no_tools_reply(
     channel: SlackChannelId,
     thread_ts: SlackTs,
     text: String,
+    user_id: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let started = std::time::Instant::now();
     let placeholder_ts = post_placeholder(&client, &channel, &thread_ts).await?;
     let cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    let result =
-        match crate::claude::run_turn(&text, None, &cwd, ToolMode::None).await {
-            Ok(r) => r,
-            Err(e) => {
-                let err_text = format!("_claude failed:_ {}", e);
-                let _ = update_message(&client, &channel, &placeholder_ts, &err_text).await;
-                return Err(e);
-            }
-        };
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    let updater = tokio::spawn(stream_updater(
+        client.clone(),
+        channel.clone(),
+        placeholder_ts.clone(),
+        rx,
+    ));
+    let result = match crate::claude::run_turn(&text, None, &cwd, ToolMode::None, Some(tx)).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = updater.await;
+            let err_text = format!("_claude failed:_ {}", e);
+            let _ = update_message(&client, &channel, &placeholder_ts, &err_text).await;
+            return Err(e);
+        }
+    };
+    let _ = updater.await;
     let display_text = truncate_for_slack(&result.text);
     update_message(&client, &channel, &placeholder_ts, &display_text).await?;
+    maybe_ping_done(&client, &channel, &thread_ts, &user_id, started.elapsed()).await;
     Ok(())
 }
 
@@ -235,8 +259,10 @@ async fn handle_full_session(
     channel: SlackChannelId,
     thread_ts: SlackTs,
     text: String,
+    user_id: String,
     surface: Surface,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let started = std::time::Instant::now();
     let store = SESSION_STORE
         .get()
         .ok_or("session store not initialized")?
@@ -315,24 +341,35 @@ async fn handle_full_session(
 
     let placeholder_ts = post_placeholder(&client, &channel, &thread_ts).await?;
 
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    let updater = tokio::spawn(stream_updater(
+        client.clone(),
+        channel.clone(),
+        placeholder_ts.clone(),
+        rx,
+    ));
     let claude_result = match crate::claude::run_turn(
         &prompt_text,
         entry.claude_session_id.as_deref(),
         &resolved_cwd,
         ToolMode::Full,
+        Some(tx),
     )
     .await
     {
         Ok(r) => r,
         Err(e) => {
+            let _ = updater.await;
             let err_text = format!("_claude failed:_ {}", e);
             let _ = update_message(&client, &channel, &placeholder_ts, &err_text).await;
             return Err(e);
         }
     };
+    let _ = updater.await;
 
     let display_text = truncate_for_slack(&claude_result.text);
     update_message(&client, &channel, &placeholder_ts, &display_text).await?;
+    maybe_ping_done(&client, &channel, &thread_ts, &user_id, started.elapsed()).await;
 
     if entry.claude_session_id.is_none() {
         entry.claude_session_id = claude_result.session_id;
@@ -749,6 +786,103 @@ fn truncate_for_slack(s: &str) -> String {
     t.push_str(&s[..end]);
     t.push_str("\n\n_[output truncated]_");
     t
+}
+
+/// Post a `<@user> _done_` reply in the thread when the turn took longer than
+/// `PING_THRESHOLD`. `chat.update` does not fire mention notifications, so a
+/// fresh `chat.postMessage` is the only way to actually ping. Skipped for
+/// quick turns to keep the thread clean. Best-effort: a failure is logged.
+async fn maybe_ping_done(
+    client: &SlackHyperClient,
+    channel: &SlackChannelId,
+    thread_ts: &SlackTs,
+    user_id: &str,
+    elapsed: std::time::Duration,
+) {
+    if elapsed < PING_THRESHOLD {
+        return;
+    }
+    let text = format!("<@{}> _done_", user_id);
+    if let Err(e) = post_reply(client, channel, thread_ts, &text).await {
+        warn!(error = %e, "ping-done reply failed");
+    }
+}
+
+/// Format an in-flight update: the accumulated text so far, capped to fit in a
+/// Slack message, with a streaming-indicator suffix. The final post is handled
+/// separately by the caller using `truncate_for_slack` once the turn completes.
+fn format_interim(text: &str) -> String {
+    const SUFFIX: &str = "\n\n_…streaming_";
+    let budget = SLACK_MAX_TEXT.saturating_sub(SUFFIX.len());
+    if text.len() <= budget {
+        let mut out = String::with_capacity(text.len() + SUFFIX.len());
+        out.push_str(text);
+        out.push_str(SUFFIX);
+        return out;
+    }
+    let mut end = budget;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + SUFFIX.len());
+    out.push_str(&text[..end]);
+    out.push_str(SUFFIX);
+    out
+}
+
+/// Consume text chunks from `rx` and call `chat.update` on the placeholder
+/// message with the accumulated text so far. The first chunk posts immediately
+/// (replacing `_thinking..._`); subsequent chunks coalesce on a 1.5 s debounce
+/// to stay well under Slack's Tier 3 rate limit (~50/min/channel). The final
+/// post is the caller's responsibility — this task exits when all senders drop.
+async fn stream_updater(
+    client: Arc<SlackHyperClient>,
+    channel: SlackChannelId,
+    ts: SlackTs,
+    mut rx: tokio::sync::mpsc::Receiver<String>,
+) {
+    use tokio::time::{sleep_until, Duration, Instant};
+    const DEBOUNCE: Duration = Duration::from_millis(1500);
+
+    let mut accumulated = String::new();
+    let mut last_post: Option<Instant> = None;
+    let mut pending = false;
+
+    loop {
+        let deadline = if pending {
+            Some(match last_post {
+                Some(t) => t + DEBOUNCE,
+                None => Instant::now(),
+            })
+        } else {
+            None
+        };
+
+        tokio::select! {
+            maybe_chunk = rx.recv() => {
+                match maybe_chunk {
+                    Some(chunk) => {
+                        accumulated.push_str(&chunk);
+                        pending = true;
+                    }
+                    None => break,
+                }
+            }
+            _ = async {
+                match deadline {
+                    Some(d) => sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let interim = format_interim(&accumulated);
+                if let Err(e) = update_message(&client, &channel, &ts, &interim).await {
+                    warn!(error = %e, "interim slack update failed");
+                }
+                last_post = Some(Instant::now());
+                pending = false;
+            }
+        }
+    }
 }
 
 fn on_error(
