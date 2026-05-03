@@ -513,7 +513,7 @@ fn add_project_via_command(name: &str, path_str: &str) -> String {
         format!("[ok] updated `{}` → `{}`", name, canonical_str)
     } else {
         format!(
-            "[ok] added `{}` → `{}`\nUse `!{}` on a *new* thread to start a session there.",
+            "[ok] added `{}` → `{}`\nUse `!start {}` on a *new* thread to start a session there.",
             name, canonical_str, name
         )
     }
@@ -626,10 +626,10 @@ fn format_project_list() -> String {
     } else {
         out.push_str("Registered projects:\n");
         for (name, path) in &registry.projects {
-            out.push_str(&format!("• `!{}` → `{}`\n", name, path));
+            out.push_str(&format!("• `{}` → `{}`\n", name, path));
         }
         out.push('\n');
-        out.push_str("Prefix the *first* message of a new thread with `!<name>` to start the session in that project.\n");
+        out.push_str("Begin a new thread with `!start <name> [<message>]` to bind the session to a project's directory.\n");
     }
     out
 }
