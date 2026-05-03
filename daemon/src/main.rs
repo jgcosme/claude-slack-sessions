@@ -69,10 +69,17 @@ async fn on_push_event(
     client: Arc<SlackHyperClient>,
     _state: SlackClientEventsUserState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let SlackEventCallbackBody::Message(msg) = event.event else {
-        return Ok(());
-    };
+    match event.event {
+        SlackEventCallbackBody::Message(msg) => on_message_event(client, msg).await,
+        SlackEventCallbackBody::AppMention(mention) => on_mention_event(client, mention).await,
+        _ => Ok(()),
+    }
+}
 
+async fn on_message_event(
+    client: Arc<SlackHyperClient>,
+    msg: SlackMessageEvent,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let is_im = msg
         .origin
         .channel_type
@@ -105,16 +112,19 @@ async fn on_push_event(
         user = %user_id,
         allowlisted = is_allowlisted,
         tier = if is_allowlisted { "full" } else { "no-tools" },
+        surface = "dm",
         channel = %channel.0,
         ts = %ts.0,
         thread_ts = %thread_ts.0,
         text = %text,
-        "DM received"
+        "event"
     );
 
     if is_allowlisted {
         tokio::spawn(async move {
-            if let Err(e) = handle_dm(client, channel, thread_ts, text).await {
+            if let Err(e) =
+                handle_full_session(client, channel, thread_ts, text, Surface::Dm).await
+            {
                 warn!(error = %e, "DM handling failed");
             }
         });
@@ -127,6 +137,64 @@ async fn on_push_event(
     }
 
     Ok(())
+}
+
+async fn on_mention_event(
+    client: Arc<SlackHyperClient>,
+    mention: SlackAppMentionEvent,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let channel = mention.channel.clone();
+    let user_id = mention.user.0.clone();
+    let ts = mention.origin.ts.clone();
+    let thread_ts = mention.origin.thread_ts.clone().unwrap_or_else(|| ts.clone());
+    let raw_text = mention.content.text.clone().unwrap_or_default();
+    let text = strip_leading_mention(&raw_text);
+
+    let allowlist = Allowlist::load().unwrap_or_default();
+    let is_allowlisted = allowlist.contains(&user_id);
+
+    info!(
+        user = %user_id,
+        allowlisted = is_allowlisted,
+        tier = if is_allowlisted { "full" } else { "no-tools" },
+        surface = "channel-mention",
+        channel = %channel.0,
+        ts = %ts.0,
+        thread_ts = %thread_ts.0,
+        text = %text,
+        "event"
+    );
+
+    if is_allowlisted {
+        tokio::spawn(async move {
+            if let Err(e) =
+                handle_full_session(client, channel, thread_ts, text, Surface::ChannelMention).await
+            {
+                warn!(error = %e, "channel mention handling failed");
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = handle_no_tools_reply(client, channel, thread_ts, text).await {
+                warn!(error = %e, "no-tools reply failed");
+            }
+        });
+    }
+
+    Ok(())
+}
+
+/// Strip a leading Slack user mention like `<@U0B230S8FFS>` (typically the bot
+/// itself) and surrounding whitespace from the start of a message. Leaves the
+/// rest of the text intact, including any other mentions deeper in the message.
+fn strip_leading_mention(text: &str) -> String {
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("<@") {
+        if let Some(end) = rest.find('>') {
+            return rest[end + 1..].trim_start().to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 /// Handle a DM from a non-allowlisted Slack user. Spawns claude with
@@ -155,11 +223,18 @@ async fn handle_no_tools_reply(
     Ok(())
 }
 
-async fn handle_dm(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Dm,
+    ChannelMention,
+}
+
+async fn handle_full_session(
     client: Arc<SlackHyperClient>,
     channel: SlackChannelId,
     thread_ts: SlackTs,
     text: String,
+    surface: Surface,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let store = SESSION_STORE
         .get()
@@ -216,6 +291,25 @@ async fn handle_dm(
             .map(PathBuf::from)
             .unwrap_or_else(default_cwd);
         (text.clone(), cwd)
+    };
+
+    // On first contact in a channel thread, fetch thread history so claude has
+    // context for what's being discussed before the mention. Skipped for DMs
+    // (no prior context to fetch) and for resumed sessions (claude already has
+    // it from the previous turn).
+    let prompt_text = if surface == Surface::ChannelMention
+        && entry.claude_session_id.is_none()
+    {
+        match fetch_thread_replies(&client, &channel, &thread_ts).await {
+            Ok(history) if history.len() > 1 => format_with_thread_context(&history, &prompt_text),
+            Ok(_) => prompt_text,
+            Err(e) => {
+                warn!(error = %e, "failed to fetch thread context; proceeding without it");
+                prompt_text
+            }
+        }
+    } else {
+        prompt_text
     };
 
     let placeholder_ts = post_placeholder(&client, &channel, &thread_ts).await?;
@@ -555,6 +649,40 @@ fn format_help() -> String {
     out.push_str("• `!allow add <user-id>` — grant a Slack user full-tools access\n");
     out.push_str("• `!allow remove <user-id>` — revoke access\n");
     out.push_str("\n• `!help` — show this message\n");
+    out
+}
+
+/// Fetch a thread's full reply history via `conversations.replies`. Returns
+/// every message in the thread including the parent.
+async fn fetch_thread_replies(
+    client: &SlackHyperClient,
+    channel: &SlackChannelId,
+    thread_ts: &SlackTs,
+) -> Result<Vec<SlackHistoryMessage>, Box<dyn std::error::Error + Send + Sync>> {
+    let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
+    let session = client.open_session(token);
+    let req = SlackApiConversationsRepliesRequest::new(channel.clone(), thread_ts.clone());
+    let resp = session.conversations_replies(&req).await?;
+    Ok(resp.messages)
+}
+
+/// Format prior thread messages as a text block prepended to the user's
+/// current prompt, so the claude session has context for what was being
+/// discussed before the bot was mentioned.
+fn format_with_thread_context(history: &[SlackHistoryMessage], current: &str) -> String {
+    let mut out = String::from("[Thread context — earlier messages in this Slack thread:]\n");
+    for msg in history {
+        let user = msg
+            .sender
+            .user
+            .as_ref()
+            .map(|u| u.0.as_str())
+            .unwrap_or("unknown");
+        let text = msg.content.text.as_deref().unwrap_or("");
+        out.push_str(&format!("<@{}>: {}\n", user, text));
+    }
+    out.push_str("[End of thread context]\n\n");
+    out.push_str(current);
     out
 }
 
