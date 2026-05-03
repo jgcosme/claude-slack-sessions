@@ -1,5 +1,5 @@
 ---
-description: Stop the daemon and remove the launchd plist. With --purge also removes log files and ~/.config/slack-sessions/. Tokens in the OS keyring are preserved.
+description: Stop the daemon and remove the launchd plist. With --purge also removes log files and ~/.config/slack-sessions/ (including stored tokens).
 allowed-tools:
   - Bash(*/slack-sessions service uninstall*)
 argument-hint: "[--purge]"
@@ -17,5 +17,5 @@ fi
 
 Print the output verbatim. After running, remind the user that:
 - The launchd plist is gone (daemon won't auto-start on reboot).
-- Slack tokens are still stored in the OS keyring; clear with `security delete-generic-password -s slack-sessions -a app-token` and same for `bot-token`.
-- The cargo-installed `slack-sessions` and `slack-sessionsd` binaries are still in `~/.cargo/bin/`; remove with `cargo uninstall slack-sessions-cli && cargo uninstall slack-sessionsd`.
+- Without `--purge`, Slack tokens remain in `~/.config/slack-sessions/credentials.json`. Delete that file (or re-run with `--purge`) to wipe them.
+- The plugin's binaries live at `${CLAUDE_PLUGIN_ROOT}/bin/slack-sessions-cli` and `${CLAUDE_PLUGIN_ROOT}/bin/slack-sessionsd`. They're removed when the plugin is uninstalled via `/plugin`.

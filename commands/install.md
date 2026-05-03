@@ -1,28 +1,18 @@
 ---
-description: Build slack-sessions binaries with cargo install and (when tokens are stored) register the daemon as a macOS launchd service. Idempotent — safe to re-run after updates or partial setups.
+description: Fetch slack-sessions binaries (prebuilt from GitHub Releases, or build from source) and register the daemon as a macOS launchd service when tokens are present. Idempotent — safe to re-run.
 allowed-tools:
-  - Bash(export *)
-  - Bash(cd *)
-  - Bash(cargo install *)
+  - Bash(*/install.sh)
   - Bash(*/slack-sessions *)
-  - Bash(*/codesign-binaries.sh)
 ---
 
-Run the install end-to-end. The flow is idempotent and self-aware: it builds binaries first, then checks whether tokens are stored before deciding whether to register the launchd service.
+Run the install end-to-end. The flow is idempotent and self-aware: it installs binaries first (download or build-from-source), then checks whether tokens are present before registering the launchd service.
 
 ```bash
-export PATH="${HOME}/.cargo/bin:${PATH}"
+set -e
 cd "${CLAUDE_PLUGIN_ROOT}" || exit 1
 
-echo "==> building binaries (cargo install --path cli, then daemon)"
-cargo install --path cli || { echo "cargo install cli failed"; exit 1; }
-cargo install --path daemon || { echo "cargo install daemon failed"; exit 1; }
-
-echo
-echo "==> re-signing binaries with stable code-signing cert"
-"${CLAUDE_PLUGIN_ROOT}/bin/codesign-binaries.sh" || {
-    echo "codesign step failed — install will continue, but expect keychain re-prompts on restart"
-}
+echo "==> installing binaries"
+bash "${CLAUDE_PLUGIN_ROOT}/bin/install.sh"
 
 WRAPPER="${CLAUDE_PLUGIN_ROOT}/bin/slack-sessions"
 
@@ -38,15 +28,15 @@ else
     echo "[--] tokens not yet stored"
     echo
     echo "Next step: in your terminal, run:"
-    echo "    slack-sessions setup"
+    echo "    ${WRAPPER} setup"
     echo "(paste the xoxb- bot token and xapp- app-level token at the hidden prompts)"
     echo
     echo "Then re-run /slack-sessions:install to register the launchd service."
 fi
 ```
 
-If `cargo install` fails because cargo isn't installed, point the user at https://rustup.rs (one-line install).
+The install script tries to download the prebuilt binary tarball matching `plugin.json`'s version from GitHub Releases. If the platform isn't covered (anything outside Darwin-arm64, Darwin-x86_64, Linux-x86_64) or the release isn't published yet, it falls back to a local `cargo build --release` — point the user at https://rustup.rs if cargo isn't installed.
 
-If `cargo install` succeeds but `setup --check` fails (tokens missing), surface the printed message verbatim — the user needs to run `slack-sessions setup` in their terminal before re-running this command. They also need to allowlist their Slack user_id via `/slack-sessions:allow add <user-id>` before the bot will respond to them.
+If `setup --check` fails (tokens missing), surface the printed message verbatim — the user needs to run `slack-sessions setup` in their terminal before re-running this command. Tokens write to `~/.config/slack-sessions/credentials.json` (mode 0600). The user also needs to allowlist their Slack user_id via `/slack-sessions:allow add <user-id>` before the bot will respond to them.
 
 If the daemon fails to start after `service install`, run `/slack-sessions:logs` to see why.

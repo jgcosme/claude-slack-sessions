@@ -1,20 +1,17 @@
 mod allowlist;
 mod config;
+mod credentials;
 mod projects;
 mod service;
 mod status;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use keyring::Entry;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::allowlist::Allowlist;
+use crate::credentials::Credentials;
 use crate::projects::ProjectsRegistry;
-
-const SERVICE: &str = "slack-sessions";
-const APP_TOKEN_ACCOUNT: &str = "app-token";
-const BOT_TOKEN_ACCOUNT: &str = "bot-token";
 
 #[derive(Parser)]
 #[command(
@@ -29,7 +26,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Store Slack tokens in the OS secret store
+    /// Store Slack tokens in ~/.config/slack-sessions/credentials.json (mode 0600)
     Setup {
         /// Verify stored tokens, don't prompt
         #[arg(long)]
@@ -159,74 +156,75 @@ fn setup_interactive() -> Result<()> {
     println!("  bot       (xoxb-...)    OAuth & Permissions -> Bot User OAuth Token");
     println!("                          scopes: chat:write, im:history, im:read");
     println!();
+    println!("Tokens write to ~/.config/slack-sessions/credentials.json (mode 0600).");
     println!("Press Enter at a prompt to keep an existing stored value.");
     println!();
 
-    prompt_and_store("app-level token", "xapp-", APP_TOKEN_ACCOUNT)?;
-    prompt_and_store("bot token", "xoxb-", BOT_TOKEN_ACCOUNT)?;
+    let mut creds = Credentials::load().context("failed to load existing credentials")?;
+    creds.app_token = Some(prompt_token("app-level token", "xapp-", creds.app_token.as_deref())?);
+    creds.save().context("failed to write credentials")?;
+    println!("[ok] stored app-level token");
+
+    creds.bot_token = Some(prompt_token("bot token", "xoxb-", creds.bot_token.as_deref())?);
+    creds.save().context("failed to write credentials")?;
+    println!("[ok] stored bot token");
 
     println!();
+    println!("[ok] wrote {}", Credentials::path()?.display());
     println!("[ok] verify with: slack-sessions setup --check");
     Ok(())
 }
 
-fn prompt_and_store(label: &str, prefix: &str, account: &str) -> Result<()> {
-    let entry = Entry::new(SERVICE, account).context("failed to open keyring entry")?;
-    let existing = entry.get_password().ok();
-
+fn prompt_token(label: &str, prefix: &str, existing: Option<&str>) -> Result<String> {
     let prompt = if existing.is_some() {
         format!("{} (Enter to keep existing): ", label)
     } else {
         format!("{} (input hidden): ", label)
     };
 
-    let token = rpassword::prompt_password(&prompt).context("failed to read from terminal")?;
-    let token = token.trim();
+    let entered = rpassword::prompt_password(&prompt).context("failed to read from terminal")?;
+    let entered = entered.trim();
 
-    if token.is_empty() {
-        if existing.is_some() {
-            println!("[ok] kept existing {}", label);
-            return Ok(());
+    if entered.is_empty() {
+        if let Some(prior) = existing {
+            return Ok(prior.to_string());
         }
         return Err(anyhow!("no {} provided", label));
     }
 
-    if !token.starts_with(prefix) {
+    if !entered.starts_with(prefix) {
         return Err(anyhow!(
             "{} does not look right (expected `{}...` prefix)",
             label,
             prefix
         ));
     }
-    if token.len() < 20 {
+    if entered.len() < 20 {
         return Err(anyhow!("{} too short to be valid", label));
     }
-
-    entry
-        .set_password(token)
-        .context("failed to write token to OS secret store")?;
-    println!("[ok] stored {}", label);
-    Ok(())
+    Ok(entered.to_string())
 }
 
 fn setup_check() -> Result<()> {
+    let creds = Credentials::load().context("failed to load credentials")?;
     let mut all_present = true;
-    for (label, account) in [
-        ("app-level (xapp-)", APP_TOKEN_ACCOUNT),
-        ("bot       (xoxb-)", BOT_TOKEN_ACCOUNT),
+    for (label, value) in [
+        ("app-level (xapp-)", creds.app_token.as_deref()),
+        ("bot       (xoxb-)", creds.bot_token.as_deref()),
     ] {
-        let entry = Entry::new(SERVICE, account).context("failed to open keyring entry")?;
-        match entry.get_password() {
-            Ok(t) => println!("[ok] {}: {}", label, mask(&t)),
-            Err(keyring::Error::NoEntry) => {
+        match value {
+            Some(t) if !t.is_empty() => println!("[ok] {}: {}", label, mask(t)),
+            _ => {
                 println!("[--] {}: not stored", label);
                 all_present = false;
             }
-            Err(e) => return Err(e).context("failed to read keyring entry"),
         }
     }
     if !all_present {
-        return Err(anyhow!("missing tokens — run `slack-sessions setup`"));
+        return Err(anyhow!(
+            "missing tokens — run `slack-sessions setup` ({})",
+            Credentials::path()?.display()
+        ));
     }
     Ok(())
 }
@@ -306,7 +304,7 @@ fn mask(s: &str) -> String {
     }
 }
 
-fn project_add(name: &str, path: &PathBuf) -> Result<()> {
+fn project_add(name: &str, path: &Path) -> Result<()> {
     ProjectsRegistry::validate_name(name).map_err(|e| anyhow!(e))?;
     let canonical = projects::canonicalize_dir(&path.to_string_lossy()).map_err(|e| anyhow!(e))?;
     let canonical_str = canonical.to_string_lossy().to_string();
@@ -354,7 +352,7 @@ fn project_remove(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn project_set_default(path: &PathBuf) -> Result<()> {
+fn project_set_default(path: &Path) -> Result<()> {
     let canonical = projects::canonicalize_dir(&path.to_string_lossy()).map_err(|e| anyhow!(e))?;
     let canonical_str = canonical.to_string_lossy().to_string();
     let mut reg = ProjectsRegistry::load().context("failed to load registry")?;

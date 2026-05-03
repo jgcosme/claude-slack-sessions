@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries (cli + daemon)
+        run: cargo build --release
+
+      - name: Run cargo unit tests
+        run: cargo test --release
+
+      - name: Lint (clippy strict)
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: bin/run wrapper smoke (binaries already built)
+        run: |
+          ln -sf "$(pwd)/target/release/slack-sessions" bin/slack-sessions-cli
+          ln -sf "$(pwd)/target/release/slack-sessionsd" bin/slack-sessionsd
+          ./bin/slack-sessions --version

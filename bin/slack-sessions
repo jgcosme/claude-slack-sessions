@@ -1,30 +1,20 @@
-#!/usr/bin/env bash
-# slack-sessions — plugin-side wrapper around the cargo-installed binary.
-#
-# Slash commands invoke this script via ${CLAUDE_PLUGIN_ROOT}/bin/slack-sessions
-# so they don't depend on the user's shell PATH (Claude Code's Bash tool runs
-# with a sparse PATH that doesn't include ~/.cargo/bin).
-#
-# Mirrors the obsidian-memory plugin's bin/run convention.
+#!/bin/bash
+# Lazy bootstrap wrapper. Ensures bin/slack-sessions-cli is installed
+# (downloads from GH Releases on first run, falls back to cargo build) then
+# execs it with whatever args followed. Used by slash-command markdown so
+# plugin install is a no-op until the first command, when binaries are
+# fetched on demand. Mirrors the obsidian-memory bin/run convention.
 
-set -euo pipefail
+set -eu
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CLI="$PLUGIN_ROOT/bin/slack-sessions-cli"
 
-# Make the cargo-installed binary findable. ~/.cargo/bin is where
-# `cargo install` writes binaries by default; rustup's installer adds it to
-# the user's interactive PATH but not to launchd / Claude Code's Bash tool.
-export PATH="${HOME}/.cargo/bin:${PATH}"
-
-if ! command -v slack-sessions >/dev/null 2>&1; then
-    cat >&2 <<'EOF'
-Error: the `slack-sessions` binary is not installed.
-
-Build and install it once with:
-  /slack-sessions:install
-
-Or directly from a terminal at the plugin root:
-  cargo install --path cli && cargo install --path daemon
-EOF
-    exit 127
+if [ ! -x "$CLI" ]; then
+  if ! bash "$SCRIPT_DIR/install.sh" >&2; then
+    echo "[slack-sessions] binary install failed; see message above" >&2
+    exit 1
+  fi
 fi
 
-exec slack-sessions "$@"
+exec "$CLI" "$@"

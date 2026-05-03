@@ -3,11 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::allowlist::Allowlist;
+use crate::credentials::Credentials;
 use crate::projects::ProjectsRegistry;
 
-const KEYRING_SERVICE: &str = "slack-sessions";
-const APP_TOKEN_ACCOUNT: &str = "app-token";
-const BOT_TOKEN_ACCOUNT: &str = "bot-token";
 const LAUNCHD_LABEL: &str = "io.thinkingmachines.slack-sessions";
 
 pub fn run() -> Result<()> {
@@ -77,25 +75,25 @@ fn section_binaries() -> bool {
 
 fn section_tokens() -> bool {
     let mut ok = true;
-    let app = read_keyring(APP_TOKEN_ACCOUNT);
-    match &app {
-        Some(t) => println!("  [ok]   app-level (xapp-)  {}", mask(t)),
-        None => {
-            println!("  [FAIL] app-level (xapp-)  not stored in keyring");
+    let creds = Credentials::load().unwrap_or_default();
+    match creds.app_token.as_deref() {
+        Some(t) if !t.is_empty() => println!("  [ok]   app-level (xapp-)  {}", mask(t)),
+        _ => {
+            println!("  [FAIL] app-level (xapp-)  not stored");
             println!("         → slack-sessions setup");
             ok = false;
         }
     }
-    let bot = read_keyring(BOT_TOKEN_ACCOUNT);
-    match &bot {
-        Some(t) => println!("  [ok]   bot       (xoxb-)  {}", mask(t)),
-        None => {
-            println!("  [FAIL] bot       (xoxb-)  not stored in keyring");
+    let bot = creds.bot_token.clone();
+    match bot.as_deref() {
+        Some(t) if !t.is_empty() => println!("  [ok]   bot       (xoxb-)  {}", mask(t)),
+        _ => {
+            println!("  [FAIL] bot       (xoxb-)  not stored");
             println!("         → slack-sessions setup");
             ok = false;
         }
     }
-    if let Some(token) = bot {
+    if let Some(token) = bot.filter(|t| !t.is_empty()) {
         match auth_test(&token) {
             Ok(team) => println!("  [ok]   auth.test          authenticated as team `{}`", team),
             Err(e) => {
@@ -228,11 +226,6 @@ fn which(prog: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn read_keyring(account: &str) -> Option<String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, account).ok()?;
-    entry.get_password().ok()
 }
 
 fn mask(s: &str) -> String {

@@ -1,0 +1,80 @@
+name: release
+
+# Cross-build matrix for prebuilt-tier platforms. Triggered on tag push
+# (`vX.Y.Z`); the install script downloads the matching tarball and falls
+# back to a local `cargo build --release` for any other platform — so
+# dropping a tier doesn't break those users, it just shifts them to
+# build-from-source.
+#
+# Each tarball ships both binaries (`slack-sessions` cli + `slack-sessionsd`
+# daemon) — they live next to each other and the cli locates the daemon by
+# parent-of-current-exe.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,     target: aarch64-apple-darwin }
+          - { os: macos-13,     target: x86_64-apple-darwin }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="slack-sessions-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
+          mkdir -p "dist/$STAGE"
+          cp "target/${{ matrix.target }}/release/slack-sessions"  "dist/$STAGE/"
+          cp "target/${{ matrix.target }}/release/slack-sessionsd" "dist/$STAGE/"
+          cp LICENSE README.md "dist/$STAGE/" 2>/dev/null || true
+          tar -C dist -czf "dist/$STAGE.tar.gz" "$STAGE"
+          (cd dist && shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: slack-sessions-${{ matrix.target }}
+          path: dist/*.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

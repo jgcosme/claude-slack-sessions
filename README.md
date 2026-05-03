@@ -70,7 +70,7 @@ In the bot's DM, prefix messages with `!` to manage the project registry without
 
 - A long-lived local daemon on macOS connects to Slack via Socket Mode (no inbound port, no SSH).
 - Per Slack `thread_ts`, the daemon manages a `claude -p --resume` subprocess. Each turn is a fresh invocation that resumes the thread's session.
-- The plugin's slash commands wrap a sibling `slack-sessions` CLI that handles app manifest, token storage (OS keyring), project registry, and launchd lifecycle.
+- The plugin's slash commands wrap a sibling `slack-sessions` CLI that handles app manifest, token storage (`~/.config/slack-sessions/credentials.json`, mode 0600), project registry, and launchd lifecycle.
 
 ## Status
 

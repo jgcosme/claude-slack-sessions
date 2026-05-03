@@ -1,6 +1,7 @@
 mod allowlist;
 mod claude;
 mod config;
+mod credentials;
 mod projects;
 mod session;
 
@@ -11,12 +12,10 @@ use tracing::{info, warn};
 
 use crate::allowlist::Allowlist;
 use crate::claude::ToolMode;
+use crate::credentials::Credentials;
 use crate::projects::ProjectsRegistry;
 use crate::session::{now_unix, SessionStore};
 
-const KEYRING_SERVICE: &str = "slack-sessions";
-const KEYRING_APP_TOKEN_ACCOUNT: &str = "app-token";
-const KEYRING_BOT_TOKEN_ACCOUNT: &str = "bot-token";
 const SLACK_MAX_TEXT: usize = 38_000;
 /// Wall-clock threshold above which we post a separate `<@user> _done_` reply
 /// in the thread after the final edit. `chat.update` does not fire mention
@@ -36,8 +35,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    let app_token_str = read_secret("SLACK_APP_TOKEN", KEYRING_APP_TOKEN_ACCOUNT, "app-level")?;
-    let bot_token_str = read_secret("SLACK_BOT_TOKEN", KEYRING_BOT_TOKEN_ACCOUNT, "bot")?;
+    let creds = Credentials::load()?;
+    let app_token_str = read_secret("SLACK_APP_TOKEN", creds.app_token.as_deref(), "app-level")?;
+    let bot_token_str = read_secret("SLACK_BOT_TOKEN", creds.bot_token.as_deref(), "bot")?;
     let app_token: SlackApiToken = SlackApiToken::new(app_token_str.into());
     let bot_token: SlackApiToken = SlackApiToken::new(bot_token_str.into());
     let _ = BOT_TOKEN.set(bot_token);
@@ -918,7 +918,7 @@ fn sessions_state_path() -> Result<PathBuf, Box<dyn std::error::Error + Send + S
 
 fn read_secret(
     env_var: &str,
-    keyring_account: &str,
+    file_value: Option<&str>,
     label: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if let Ok(t) = std::env::var(env_var) {
@@ -927,17 +927,15 @@ fn read_secret(
             return Ok(t);
         }
     }
-    let entry = keyring::Entry::new(KEYRING_SERVICE, keyring_account)?;
-    match entry.get_password() {
-        Ok(t) => {
-            info!(label, "using token from OS secret store");
-            Ok(t)
+    match file_value {
+        Some(t) if !t.is_empty() => {
+            info!(label, "using token from credentials file");
+            Ok(t.to_string())
         }
-        Err(keyring::Error::NoEntry) => Err(format!(
+        _ => Err(format!(
             "no {} token found — run `slack-sessions setup` or set {}",
             label, env_var
         )
         .into()),
-        Err(e) => Err(e.into()),
     }
 }

@@ -16,3 +16,9 @@ secrets.env
 
 # Rust build artifacts
 /target/
+
+# Locally-installed binaries (downloaded by bin/install.sh from GH Releases,
+# or built from source). Repo only ships the wrappers (bin/slack-sessions,
+# bin/install.sh).
+/bin/slack-sessions-cli
+/bin/slack-sessionsd

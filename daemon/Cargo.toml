@@ -15,7 +15,6 @@ slack-morphism = { version = "2.20", features = ["hyper"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "io-util", "fs", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 json5 = "0.4"
