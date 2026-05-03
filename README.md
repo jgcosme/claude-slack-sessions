@@ -1,6 +1,6 @@
 ---
 type: reference
-description: "Overview of slack-sessions plugin - one isolated Claude Code session per Slack thread, early scaffold status."
+description: "Overview of slack-sessions plugin — one isolated Claude Code session per Slack thread, with manifest-driven Slack-app onboarding, launchd service, and `!`-prefixed Slack-side admin commands."
 created: 2026-05-02
 project: claude-slack-sessions
 ---
@@ -30,15 +30,51 @@ Anthropic ships [Remote Control](https://code.claude.com/docs/en/remote-control)
 
 If none of those apply, prefer Remote Control.
 
-## Architecture (planned)
+## Install
+
+Requires a macOS machine with [Rust](https://rustup.rs) installed. Inside Claude Code:
+
+```
+/plugin marketplace add jgcosme/claude-plugins
+/plugin install slack-sessions@jgcosme-plugins
+/slack-sessions:setup
+```
+
+`/slack-sessions:setup` walks you through the rest: it points you at `/slack-sessions:manifest` (which copies the Slack app manifest YAML to your clipboard for paste into "Create New App → From a manifest"), shows you where to grab the two tokens (`xoxb-` from OAuth & Permissions, `xapp-` from Basic Information → App-Level Tokens), and tells you to run `slack-sessions setup` in your terminal to paste them. Then `/slack-sessions:install` builds the binaries (`cargo install`) and registers the daemon with `launchd` so it survives reboots.
+
+Other slash commands (all wrap the `slack-sessions` CLI):
+
+| Command | What it does |
+|---|---|
+| `/slack-sessions:manifest` | Print + clipboard-copy the Slack app manifest |
+| `/slack-sessions:install` | Build binaries and register the launchd service |
+| `/slack-sessions:start` / `:stop` / `:restart` | launchctl load / bootout / kickstart -k |
+| `/slack-sessions:status` | Daemon loaded?, pid, last exit |
+| `/slack-sessions:logs [N]` | Tail last N lines of the daemon log |
+| `/slack-sessions:uninstall [--purge]` | Bootout + remove plist; `--purge` also clears logs |
+
+## Slack-side admin (any time, no Claude spawn)
+
+In the bot's DM, prefix messages with `!` to manage the project registry without leaving Slack:
+
+```
+!list                        # show registered projects + default cwd
+!start <project> [<msg>]     # bind the *first* message of a thread to a project's directory
+!add <name> <path>           # register a project (supports ~)
+!remove <name>  (or !rm)     # remove a project
+!set-default <path>          # default working dir for unprefixed DMs
+!help                        # this list
+```
+
+## Architecture
 
 - A long-lived local daemon on macOS connects to Slack via Socket Mode (no inbound port, no SSH).
-- Per Slack `thread_ts`, the daemon manages a `claude` subprocess and resumes it on reply.
-- The Claude Code plugin layer (this repo) provides slash commands to install, start, stop, and inspect the daemon.
+- Per Slack `thread_ts`, the daemon manages a `claude -p --resume` subprocess. Each turn is a fresh invocation that resumes the thread's session.
+- The plugin's slash commands wrap a sibling `slack-sessions` CLI that handles app manifest, token storage (OS keyring), project registry, and launchd lifecycle.
 
 ## Status
 
-Early. The Slack DM → daemon → `claude --resume` → threaded reply loop works end-to-end on macOS. Plugin slash commands (`install` / `start` / `stop` / `status`), `launchd` service install, per-thread working directory, and progressive output streaming are still TODO.
+Working: DM → `claude --resume` loop, project registry with bang-prefix selection, launchd persistence with `caffeinate` keep-awake, plugin slash commands, app manifest. Coming next: bot-channel participation (allowlist + read-only by default) and progressive output streaming.
 
 ## License
 
