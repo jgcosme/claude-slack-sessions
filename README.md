@@ -49,7 +49,7 @@ Other slash commands (all wrap the `slack-sessions` CLI):
 | `/slack-sessions:manifest` | Print + clipboard-copy the Slack app manifest |
 | `/slack-sessions:install` | Build binaries and register the launchd service |
 | `/slack-sessions:start` / `:stop` / `:restart` | launchctl load / bootout / kickstart -k |
-| `/slack-sessions:status` | Daemon loaded?, pid, last exit |
+| `/slack-sessions:status` | Health check: binaries, tokens (live `auth.test`), config, daemon |
 | `/slack-sessions:logs [N]` | Tail last N lines of the daemon log |
 | `/slack-sessions:uninstall [--purge]` | Bootout + remove plist; `--purge` also clears logs |
 

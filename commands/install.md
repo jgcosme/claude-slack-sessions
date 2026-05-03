@@ -12,7 +12,7 @@ Install slack-sessions end-to-end:
 2. `cargo install --path cli` — installs the `slack-sessions` binary to `~/.cargo/bin/` (incremental; fast after first build).
 3. `cargo install --path daemon` — installs `slack-sessionsd` next to it.
 4. `slack-sessions service install` — writes `~/Library/LaunchAgents/io.thinkingmachines.slack-sessions.plist`, runs `launchctl bootstrap`, daemon starts.
-5. `slack-sessions service status` — confirm the daemon is running.
+5. `slack-sessions status` — comprehensive health check (binaries, tokens, config, daemon). Confirm everything is `[ok]`.
 
 Surface any errors verbatim. If `cargo` is not found, tell the user they need Rust installed (`curl https://sh.rustup.rs -sSf | sh`).
 

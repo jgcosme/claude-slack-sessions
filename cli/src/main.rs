@@ -2,6 +2,7 @@ mod allowlist;
 mod config;
 mod projects;
 mod service;
+mod status;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -39,6 +40,8 @@ enum Command {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Comprehensive health check (binaries, tokens, config, daemon)
+    Status,
     /// Manage the macOS launchd service for the daemon
     Service {
         #[command(subcommand)]
@@ -77,8 +80,6 @@ enum ServiceAction {
     Stop,
     /// Kill and restart the daemon
     Restart,
-    /// Show daemon status: loaded, pid, last exit
-    Status,
     /// Bootout, remove plist, optionally remove logs
     Uninstall {
         /// Also delete log files
@@ -131,12 +132,12 @@ fn main() -> Result<()> {
             ProjectAction::Remove { name } => project_remove(&name),
             ProjectAction::SetDefault { path } => project_set_default(&path),
         },
+        Command::Status => status::run(),
         Command::Service { action } => match action {
             ServiceAction::Install => service::install(),
             ServiceAction::Start => service::start(),
             ServiceAction::Stop => service::stop(),
             ServiceAction::Restart => service::restart(),
-            ServiceAction::Status => service::status(),
             ServiceAction::Uninstall { purge } => service::uninstall(purge),
             ServiceAction::Logs { follow, lines } => service::logs(follow, lines),
         },

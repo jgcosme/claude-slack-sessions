@@ -76,38 +76,6 @@ pub fn restart() -> Result<()> {
     Ok(())
 }
 
-pub fn status() -> Result<()> {
-    let uid = current_uid()?;
-    let target = format!("gui/{}/{}", uid, LABEL);
-    match launchctl_capture(&["print", &target]) {
-        Ok(out) => {
-            let pid_line = out.lines().find(|l| l.trim().starts_with("pid ="));
-            let state_line = out.lines().find(|l| l.trim().starts_with("state ="));
-            let last_exit = out
-                .lines()
-                .find(|l| l.trim().starts_with("last exit code"));
-            println!("[ok] daemon: loaded");
-            if let Some(s) = state_line {
-                println!("     {}", s.trim());
-            }
-            if let Some(p) = pid_line {
-                println!("     {}", p.trim());
-            } else {
-                println!("     (no pid — not running)");
-            }
-            if let Some(e) = last_exit {
-                println!("     {}", e.trim());
-            }
-            println!("     logs: {}", log_dir()?.join("out.log").display());
-        }
-        Err(_) => {
-            println!("[--] daemon: not loaded");
-            println!("     install with: slack-sessions service install");
-        }
-    }
-    Ok(())
-}
-
 pub fn uninstall(purge: bool) -> Result<()> {
     let uid = current_uid()?;
     let target = format!("gui/{}/{}", uid, LABEL);
