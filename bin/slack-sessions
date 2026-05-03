@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# slack-sessions — plugin-side wrapper around the cargo-installed binary.
+#
+# Slash commands invoke this script via ${CLAUDE_PLUGIN_ROOT}/bin/slack-sessions
+# so they don't depend on the user's shell PATH (Claude Code's Bash tool runs
+# with a sparse PATH that doesn't include ~/.cargo/bin).
+#
+# Mirrors the obsidian-memory plugin's bin/run convention.
+
+set -euo pipefail
+
+# Make the cargo-installed binary findable. ~/.cargo/bin is where
+# `cargo install` writes binaries by default; rustup's installer adds it to
+# the user's interactive PATH but not to launchd / Claude Code's Bash tool.
+export PATH="${HOME}/.cargo/bin:${PATH}"
+
+if ! command -v slack-sessions >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+Error: the `slack-sessions` binary is not installed.
+
+Build and install it once with:
+  /slack-sessions:install
+
+Or directly from a terminal at the plugin root:
+  cargo install --path cli && cargo install --path daemon
+EOF
+    exit 127
+fi
+
+exec slack-sessions "$@"

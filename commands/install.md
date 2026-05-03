@@ -1,19 +1,45 @@
 ---
-description: Build slack-sessions binaries with cargo install and register the daemon as a macOS launchd service. Idempotent — safe to re-run after updates.
+description: Build slack-sessions binaries with cargo install and (when tokens are stored) register the daemon as a macOS launchd service. Idempotent — safe to re-run after updates or partial setups.
 allowed-tools:
+  - Bash(export *)
   - Bash(cd *)
   - Bash(cargo install *)
-  - Bash(slack-sessions *)
+  - Bash(*/slack-sessions *)
 ---
 
-Install slack-sessions end-to-end:
+Run the install end-to-end. The flow is idempotent and self-aware: it builds binaries first, then checks whether tokens are stored before deciding whether to register the launchd service.
 
-1. `cd "${CLAUDE_PLUGIN_ROOT}"`
-2. `cargo install --path cli` — installs the `slack-sessions` binary to `~/.cargo/bin/` (incremental; fast after first build).
-3. `cargo install --path daemon` — installs `slack-sessionsd` next to it.
-4. `slack-sessions service install` — writes `~/Library/LaunchAgents/io.thinkingmachines.slack-sessions.plist`, runs `launchctl bootstrap`, daemon starts.
-5. `slack-sessions status` — comprehensive health check (binaries, tokens, config, daemon). Confirm everything is `[ok]`.
+```bash
+export PATH="${HOME}/.cargo/bin:${PATH}"
+cd "${CLAUDE_PLUGIN_ROOT}" || exit 1
 
-Surface any errors verbatim. If `cargo` is not found, tell the user they need Rust installed (`curl https://sh.rustup.rs -sSf | sh`).
+echo "==> building binaries (cargo install --path cli, then daemon)"
+cargo install --path cli || { echo "cargo install cli failed"; exit 1; }
+cargo install --path daemon || { echo "cargo install daemon failed"; exit 1; }
 
-If the daemon fails to start, suggest they run `/slack-sessions:logs` to see what went wrong (most likely a missing token — point them at `slack-sessions setup` in their terminal).
+WRAPPER="${CLAUDE_PLUGIN_ROOT}/bin/slack-sessions"
+
+echo
+echo "==> checking tokens"
+if "${WRAPPER}" setup --check >/dev/null 2>&1; then
+    echo "[ok] tokens stored — registering launchd service"
+    "${WRAPPER}" service install
+    echo
+    echo "==> verifying"
+    "${WRAPPER}" status
+else
+    echo "[--] tokens not yet stored"
+    echo
+    echo "Next step: in your terminal, run:"
+    echo "    slack-sessions setup"
+    echo "(paste the xoxb- bot token and xapp- app-level token at the hidden prompts)"
+    echo
+    echo "Then re-run /slack-sessions:install to register the launchd service."
+fi
+```
+
+If `cargo install` fails because cargo isn't installed, point the user at https://rustup.rs (one-line install).
+
+If `cargo install` succeeds but `setup --check` fails (tokens missing), surface the printed message verbatim — the user needs to run `slack-sessions setup` in their terminal before re-running this command. They also need to allowlist their Slack user_id via `/slack-sessions:allow add <user-id>` before the bot will respond to them.
+
+If the daemon fails to start after `service install`, run `/slack-sessions:logs` to see why.
