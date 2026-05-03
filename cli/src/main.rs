@@ -1,4 +1,5 @@
 mod projects;
+mod service;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -34,6 +35,40 @@ enum Command {
     Project {
         #[command(subcommand)]
         action: ProjectAction,
+    },
+    /// Manage the macOS launchd service for the daemon
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Write the launchd plist and load the daemon (idempotent)
+    Install,
+    /// Start the daemon (load if not yet loaded)
+    Start,
+    /// Stop the daemon (bootout)
+    Stop,
+    /// Kill and restart the daemon
+    Restart,
+    /// Show daemon status: loaded, pid, last exit
+    Status,
+    /// Bootout, remove plist, optionally remove logs
+    Uninstall {
+        /// Also delete log files
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Tail the daemon log file
+    Logs {
+        /// Follow the log (like `tail -f`)
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of lines to print
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: u32,
     },
 }
 
@@ -71,6 +106,15 @@ fn main() -> Result<()> {
             ProjectAction::List => project_list(),
             ProjectAction::Remove { name } => project_remove(&name),
             ProjectAction::SetDefault { path } => project_set_default(&path),
+        },
+        Command::Service { action } => match action {
+            ServiceAction::Install => service::install(),
+            ServiceAction::Start => service::start(),
+            ServiceAction::Stop => service::stop(),
+            ServiceAction::Restart => service::restart(),
+            ServiceAction::Status => service::status(),
+            ServiceAction::Uninstall { purge } => service::uninstall(purge),
+            ServiceAction::Logs { follow, lines } => service::logs(follow, lines),
         },
     }
 }

@@ -13,7 +13,6 @@ use crate::session::{now_unix, SessionStore};
 const KEYRING_SERVICE: &str = "slack-sessions";
 const KEYRING_APP_TOKEN_ACCOUNT: &str = "app-token";
 const KEYRING_BOT_TOKEN_ACCOUNT: &str = "bot-token";
-const STATE_PATH: &str = ".runtime/sessions.json";
 const SLACK_MAX_TEXT: usize = 38_000;
 
 static BOT_TOKEN: OnceLock<SlackApiToken> = OnceLock::new();
@@ -34,8 +33,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bot_token: SlackApiToken = SlackApiToken::new(bot_token_str.into());
     let _ = BOT_TOKEN.set(bot_token);
 
-    let store = Arc::new(SessionStore::load(PathBuf::from(STATE_PATH)).await?);
-    info!(path = STATE_PATH, "session store loaded");
+    spawn_caffeinate();
+
+    let state_path = sessions_state_path()?;
+    let store = Arc::new(SessionStore::load(state_path.clone()).await?);
+    info!(path = %state_path.display(), "session store loaded");
     let _ = SESSION_STORE.set(store);
 
     let client = Arc::new(SlackClient::new(SlackClientHyperConnector::new()?));
@@ -488,6 +490,29 @@ fn on_error(
 ) -> HttpStatusCode {
     warn!(error = %err, "slack listener error");
     HttpStatusCode::OK
+}
+
+/// Spawn `caffeinate -dimsu -w <our-pid>` as a detached child so macOS doesn't
+/// sleep while the daemon is running. caffeinate exits automatically when our
+/// PID dies, so no explicit teardown is needed. Best-effort: a failure is
+/// logged but doesn't stop the daemon.
+fn spawn_caffeinate() {
+    let pid = std::process::id().to_string();
+    let result = std::process::Command::new("caffeinate")
+        .args(["-dimsu", "-w", &pid])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match result {
+        Ok(_) => info!("caffeinate started; system sleep prevented while daemon is up"),
+        Err(e) => warn!(error = %e, "failed to start caffeinate; system may sleep the daemon"),
+    }
+}
+
+fn sessions_state_path() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let dir = dirs::config_dir().ok_or("no config dir for this platform")?;
+    Ok(dir.join("slack-sessions").join("sessions.json"))
 }
 
 fn read_secret(
