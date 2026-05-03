@@ -5,6 +5,7 @@ allowed-tools:
   - Bash(cd *)
   - Bash(cargo install *)
   - Bash(*/slack-sessions *)
+  - Bash(*/codesign-binaries.sh)
 ---
 
 Run the install end-to-end. The flow is idempotent and self-aware: it builds binaries first, then checks whether tokens are stored before deciding whether to register the launchd service.
@@ -16,6 +17,12 @@ cd "${CLAUDE_PLUGIN_ROOT}" || exit 1
 echo "==> building binaries (cargo install --path cli, then daemon)"
 cargo install --path cli || { echo "cargo install cli failed"; exit 1; }
 cargo install --path daemon || { echo "cargo install daemon failed"; exit 1; }
+
+echo
+echo "==> re-signing binaries with stable code-signing cert"
+"${CLAUDE_PLUGIN_ROOT}/bin/codesign-binaries.sh" || {
+    echo "codesign step failed — install will continue, but expect keychain re-prompts on restart"
+}
 
 WRAPPER="${CLAUDE_PLUGIN_ROOT}/bin/slack-sessions"
 
