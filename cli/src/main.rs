@@ -69,20 +69,16 @@ enum AllowAction {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    /// Write the launchd plist and load the daemon (idempotent)
-    Install,
-    /// Start the daemon (load if not yet loaded)
+    /// Start the daemon (writes the launchd plist and bootstraps if not yet registered; idempotent)
     Start,
-    /// Stop the daemon (bootout)
-    Stop,
-    /// Kill and restart the daemon
-    Restart,
-    /// Bootout, remove plist, optionally remove logs
-    Uninstall {
-        /// Also delete log files
+    /// Stop the daemon and remove its launchd registration
+    Stop {
+        /// Also delete log files and ~/.config/slack-sessions/ (tokens included)
         #[arg(long)]
         purge: bool,
     },
+    /// Kill and restart the daemon
+    Restart,
     /// Tail the daemon log file
     Logs {
         /// Follow the log (like `tail -f`)
@@ -131,11 +127,9 @@ fn main() -> Result<()> {
         },
         Command::Status => status::run(),
         Command::Service { action } => match action {
-            ServiceAction::Install => service::install(),
             ServiceAction::Start => service::start(),
-            ServiceAction::Stop => service::stop(),
+            ServiceAction::Stop { purge } => service::stop(purge),
             ServiceAction::Restart => service::restart(),
-            ServiceAction::Uninstall { purge } => service::uninstall(purge),
             ServiceAction::Logs { follow, lines } => service::logs(follow, lines),
         },
         Command::Manifest { copy } => manifest_command(copy),

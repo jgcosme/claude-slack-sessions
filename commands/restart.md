@@ -8,4 +8,4 @@ allowed-tools:
 "${CLAUDE_PLUGIN_ROOT}/bin/slack-sessions" service restart
 ```
 
-Report the output verbatim.
+Report the output verbatim. If the kickstart fails because the daemon was never registered, point the user at `/slack-sessions:start`.

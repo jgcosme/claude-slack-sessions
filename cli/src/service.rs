@@ -6,96 +6,80 @@ const LABEL: &str = "io.thinkingmachines.slack-sessions";
 const PLIST_FILENAME: &str = "io.thinkingmachines.slack-sessions.plist";
 const DAEMON_BINARY: &str = "slack-sessionsd";
 
-pub fn install() -> Result<()> {
-    let daemon_path = find_daemon_binary()?;
-    let log_dir = log_dir()?;
-    std::fs::create_dir_all(&log_dir).context("create log dir")?;
-
-    let plist_path = plist_path()?;
-    if let Some(parent) = plist_path.parent() {
-        std::fs::create_dir_all(parent).context("create LaunchAgents dir")?;
-    }
-
-    let plist_contents = render_plist(&daemon_path, &log_dir)?;
-    std::fs::write(&plist_path, plist_contents).context("write plist")?;
-    println!("[ok] wrote {}", plist_path.display());
-
-    // bootstrap: load and start. If already loaded, error — bootout first.
-    let uid = current_uid()?;
-    let domain = format!("gui/{}", uid);
-    let plist_str = plist_path
-        .to_str()
-        .ok_or_else(|| anyhow!("plist path not valid utf-8"))?;
-    // If a previous version is loaded, bootout first so bootstrap doesn't fail.
-    let _ = launchctl(&["bootout", &format!("{}/{}", domain, LABEL)]);
-    launchctl(&["bootstrap", &domain, plist_str]).context("launchctl bootstrap")?;
-    println!("[ok] daemon loaded (label: {})", LABEL);
-    println!("     logs: {}/out.log", log_dir.display());
-    println!("     status: slack-sessions service status");
-    Ok(())
-}
-
+/// Start the daemon, registering the launchd service if it isn't already.
+///
+/// Idempotent across all states:
+///   - plist missing                → write plist, bootstrap
+///   - plist exists, not loaded     → bootstrap from existing plist
+///   - plist exists, loaded         → kickstart (no-op if already running)
+///
+/// `bootout` of any prior version is attempted before bootstrap so a stale
+/// registration doesn't make `bootstrap` fail with "service already loaded".
 pub fn start() -> Result<()> {
     let uid = current_uid()?;
     let target = format!("gui/{}/{}", uid, LABEL);
+
+    // Already loaded? Just kickstart.
     if launchctl_capture(&["print", &target]).is_ok() {
-        // Already loaded — kickstart (no-op if running)
         launchctl(&["kickstart", &target])?;
         println!("[ok] daemon kicked");
         return Ok(());
     }
-    // Not loaded — bootstrap from plist
-    let plist_path = plist_path()?;
-    if !plist_path.exists() {
-        return Err(anyhow!(
-            "not installed — run `slack-sessions service install` first"
-        ));
+
+    // Not loaded — make sure we have a plist, then bootstrap.
+    let plist = plist_path()?;
+    let log_dir = log_dir()?;
+
+    // Always (re-)write the plist on cold start. This covers two cases:
+    // first install (no plist), and post-update (plist points at an
+    // out-of-date daemon path because the plugin moved between cache dirs).
+    std::fs::create_dir_all(&log_dir).context("create log dir")?;
+    if let Some(parent) = plist.parent() {
+        std::fs::create_dir_all(parent).context("create LaunchAgents dir")?;
     }
-    let plist_str = plist_path
+    let daemon = find_daemon_binary()?;
+    std::fs::write(&plist, render_plist(&daemon, &log_dir)?).context("write plist")?;
+    println!("[ok] wrote {}", plist.display());
+
+    // Bootout any stale registration first so bootstrap doesn't fail.
+    let _ = launchctl(&["bootout", &target]);
+
+    let plist_str = plist
         .to_str()
         .ok_or_else(|| anyhow!("plist path not valid utf-8"))?;
-    launchctl(&["bootstrap", &format!("gui/{}", uid), plist_str])?;
-    println!("[ok] daemon loaded");
+    launchctl(&["bootstrap", &format!("gui/{}", uid), plist_str])
+        .context("launchctl bootstrap")?;
+    println!("[ok] daemon loaded (label: {})", LABEL);
+    println!("     logs: {}/out.log", log_dir.display());
     Ok(())
 }
 
-pub fn stop() -> Result<()> {
+/// Stop the daemon and remove its launchd registration.
+///
+/// With `purge`, also wipes log files and `~/.config/slack-sessions/`
+/// (tokens and other state).
+pub fn stop(purge: bool) -> Result<()> {
     let uid = current_uid()?;
     let target = format!("gui/{}/{}", uid, LABEL);
-    launchctl(&["bootout", &target]).context("launchctl bootout")?;
-    println!("[ok] daemon stopped");
-    Ok(())
-}
 
-pub fn restart() -> Result<()> {
-    let uid = current_uid()?;
-    let target = format!("gui/{}/{}", uid, LABEL);
-    // -k kills the running process, then starts a fresh one.
-    launchctl(&["kickstart", "-k", &target])?;
-    println!("[ok] daemon restarted");
-    Ok(())
-}
-
-pub fn uninstall(purge: bool) -> Result<()> {
-    let uid = current_uid()?;
-    let target = format!("gui/{}/{}", uid, LABEL);
-    // Ignore bootout failure (not loaded is fine).
+    // Bootout — ignore failure, "not loaded" is a fine starting state.
     let _ = launchctl(&["bootout", &target]);
-    let plist_path = plist_path()?;
-    if plist_path.exists() {
-        std::fs::remove_file(&plist_path).context("remove plist")?;
-        println!("[ok] removed {}", plist_path.display());
+
+    let plist = plist_path()?;
+    if plist.exists() {
+        std::fs::remove_file(&plist).context("remove plist")?;
+        println!("[ok] removed {}", plist.display());
     } else {
-        println!("[--] no plist at {}", plist_path.display());
+        println!("[--] no plist at {}", plist.display());
     }
+
     if purge {
         let log_dir = log_dir()?;
         if log_dir.exists() {
             std::fs::remove_dir_all(&log_dir).ok();
             println!("[ok] removed logs at {}", log_dir.display());
         }
-        let config_dir = crate::config::config_dir().ok();
-        if let Some(dir) = config_dir.filter(|d| d.exists()) {
+        if let Some(dir) = crate::config::config_dir().ok().filter(|d| d.exists()) {
             std::fs::remove_dir_all(&dir).ok();
             println!("[ok] removed config at {} (tokens included)", dir.display());
         }
@@ -103,11 +87,22 @@ pub fn uninstall(purge: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn restart() -> Result<()> {
+    let uid = current_uid()?;
+    let target = format!("gui/{}/{}", uid, LABEL);
+    // -k kills the running process, then starts a fresh one.
+    launchctl(&["kickstart", "-k", &target]).context(
+        "kickstart failed — if the daemon was never registered, run `slack-sessions service start` first",
+    )?;
+    println!("[ok] daemon restarted");
+    Ok(())
+}
+
 pub fn logs(follow: bool, lines: u32) -> Result<()> {
     let log_path = log_dir()?.join("out.log");
     if !log_path.exists() {
         return Err(anyhow!(
-            "no logs yet at {}\n(daemon may not have started; check `slack-sessions service status`)",
+            "no logs yet at {}\n(daemon may not have started; check `slack-sessions status`)",
             log_path.display()
         ));
     }

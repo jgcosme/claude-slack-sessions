@@ -189,7 +189,7 @@ fn section_daemon() -> bool {
         }
         (Err(_), _) => {
             println!("  [FAIL] launchd service    not loaded");
-            println!("         → /slack-sessions:install");
+            println!("         → /slack-sessions:start");
             ok = false;
         }
     }

@@ -32,7 +32,7 @@ If none of those apply, prefer Remote Control.
 
 ## Install
 
-Requires a macOS machine with [Rust](https://rustup.rs) installed. Inside Claude Code:
+Requires a macOS machine. Inside Claude Code:
 
 ```
 /plugin marketplace add jgcosme/claude-plugins
@@ -40,18 +40,21 @@ Requires a macOS machine with [Rust](https://rustup.rs) installed. Inside Claude
 /slack-sessions:setup
 ```
 
-`/slack-sessions:setup` walks you through the rest: it points you at `/slack-sessions:manifest` (which copies the Slack app manifest YAML to your clipboard for paste into "Create New App → From a manifest"), shows you where to grab the two tokens (`xoxb-` from OAuth & Permissions, `xapp-` from Basic Information → App-Level Tokens), and tells you to run `slack-sessions setup` in your terminal to paste them. Then `/slack-sessions:install` builds the binaries (`cargo install`) and registers the daemon with `launchd` so it survives reboots.
+Binaries fetch automatically from GitHub Releases on first command (Apple Silicon and Linux x86_64 prebuilts; everything else falls back to a local `cargo build` and needs [Rust](https://rustup.rs) installed).
+
+`/slack-sessions:setup` prints the Slack app manifest (and copies it to your clipboard for paste into "Create New App → From a manifest"), shows you where to grab the two tokens (`xoxb-` from OAuth & Permissions, `xapp-` from Basic Information → App-Level Tokens), and tells you to run `slack-sessions setup` in a real terminal to paste them. Then `/slack-sessions:start` registers the daemon with `launchd` so it survives reboots.
 
 Other slash commands (all wrap the `slack-sessions` CLI):
 
 | Command | What it does |
 |---|---|
-| `/slack-sessions:manifest` | Print + clipboard-copy the Slack app manifest |
-| `/slack-sessions:install` | Build binaries and register the launchd service |
-| `/slack-sessions:start` / `:stop` / `:restart` | launchctl load / bootout / kickstart -k |
+| `/slack-sessions:start` | Register the launchd service (idempotent) and start the daemon |
+| `/slack-sessions:stop [--purge]` | Bootout + remove plist; `--purge` also wipes logs and tokens |
+| `/slack-sessions:restart` | `launchctl kickstart -k` |
 | `/slack-sessions:status` | Health check: binaries, tokens (live `auth.test`), config, daemon |
 | `/slack-sessions:logs [N]` | Tail last N lines of the daemon log |
-| `/slack-sessions:uninstall [--purge]` | Bootout + remove plist; `--purge` also clears logs |
+| `/slack-sessions:allow <verb>` | Manage the Slack user_id allowlist |
+| `/slack-sessions:project <verb>` | Manage the project registry |
 
 ## Slack-side admin (any time, no Claude spawn)
 
