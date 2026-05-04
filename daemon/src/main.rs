@@ -11,7 +11,6 @@ use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
 use crate::allowlist::Allowlist;
-use crate::claude::ToolMode;
 use crate::credentials::Credentials;
 use crate::projects::ProjectsRegistry;
 use crate::session::{now_unix, SessionStore};
@@ -117,7 +116,7 @@ async fn on_message_event(
     info!(
         user = %user_id,
         allowlisted = is_allowlisted,
-        tier = if is_allowlisted { "full" } else { "no-tools" },
+        tier = if is_allowlisted { "full" } else { "denied" },
         surface = "dm",
         channel = %channel.0,
         ts = %ts.0,
@@ -128,16 +127,24 @@ async fn on_message_event(
 
     if is_allowlisted {
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_full_session(client, channel, thread_ts, text, user_id, Surface::Dm).await
+            if let Err(e) = handle_full_session(
+                client,
+                channel,
+                thread_ts,
+                ts,
+                text,
+                user_id,
+                Surface::Dm,
+            )
+            .await
             {
                 warn!(error = %e, "DM handling failed");
             }
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = handle_no_tools_reply(client, channel, thread_ts, text, user_id).await {
-                warn!(error = %e, "no-tools reply failed");
+            if let Err(e) = handle_denied_reply(client, channel, thread_ts, user_id).await {
+                warn!(error = %e, "denied reply failed");
             }
         });
     }
@@ -162,7 +169,7 @@ async fn on_mention_event(
     info!(
         user = %user_id,
         allowlisted = is_allowlisted,
-        tier = if is_allowlisted { "full" } else { "no-tools" },
+        tier = if is_allowlisted { "full" } else { "denied" },
         surface = "channel-mention",
         channel = %channel.0,
         ts = %ts.0,
@@ -177,6 +184,7 @@ async fn on_mention_event(
                 client,
                 channel,
                 thread_ts,
+                ts,
                 text,
                 user_id,
                 Surface::ChannelMention,
@@ -188,8 +196,8 @@ async fn on_mention_event(
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = handle_no_tools_reply(client, channel, thread_ts, text, user_id).await {
-                warn!(error = %e, "no-tools reply failed");
+            if let Err(e) = handle_denied_reply(client, channel, thread_ts, user_id).await {
+                warn!(error = %e, "denied reply failed");
             }
         });
     }
@@ -210,41 +218,27 @@ fn strip_leading_mention(text: &str) -> String {
     trimmed.to_string()
 }
 
-/// Handle a DM from a non-allowlisted Slack user. Spawns claude with
-/// `--tools ""` (no filesystem, no Bash, no MCP, no network) and posts a
-/// one-shot reply. No session resume, no thread state — every message is
-/// answered fresh.
-async fn handle_no_tools_reply(
+/// Reply to a non-allowlisted Slack user with a static refusal. No claude
+/// invocation, no session creation, no LLM cost.
+async fn handle_denied_reply(
     client: Arc<SlackHyperClient>,
     channel: SlackChannelId,
     thread_ts: SlackTs,
-    text: String,
     user_id: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let started = std::time::Instant::now();
-    let placeholder_ts = post_placeholder(&client, &channel, &thread_ts).await?;
-    let cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
-    let updater = tokio::spawn(stream_updater(
-        client.clone(),
-        channel.clone(),
-        placeholder_ts.clone(),
-        rx,
-    ));
-    let result = match crate::claude::run_turn(&text, None, &cwd, ToolMode::None, Some(tx)).await {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = updater.await;
-            let err_text = format!("_claude failed:_ {}", e);
-            let _ = update_message(&client, &channel, &placeholder_ts, &err_text).await;
-            return Err(e);
-        }
-    };
-    let _ = updater.await;
-    let display_text = truncate_for_slack(&result.text);
-    update_message(&client, &channel, &placeholder_ts, &display_text).await?;
-    maybe_ping_done(&client, &channel, &thread_ts, &user_id, started.elapsed()).await;
+    let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
+    let session = client.open_session(token);
+    let text = format!(
+        "You are not in the allow list. This bot is invitation-only. \
+         To request access, share your Slack member ID `{}` with the bot owner.",
+        user_id
+    );
+    let req = SlackApiChatPostMessageRequest::new(
+        channel,
+        SlackMessageContent::new().with_text(text),
+    )
+    .with_thread_ts(thread_ts);
+    session.chat_post_message(&req).await?;
     Ok(())
 }
 
@@ -258,6 +252,7 @@ async fn handle_full_session(
     client: Arc<SlackHyperClient>,
     channel: SlackChannelId,
     thread_ts: SlackTs,
+    trigger_ts: SlackTs,
     text: String,
     user_id: String,
     surface: Surface,
@@ -320,16 +315,34 @@ async fn handle_full_session(
         (text.clone(), cwd)
     };
 
-    // On first contact in a channel thread, fetch thread history so claude has
-    // context for what's being discussed before the mention. Skipped for DMs
-    // (no prior context to fetch) and for resumed sessions (claude already has
-    // it from the previous turn).
-    let prompt_text = if surface == Surface::ChannelMention
-        && entry.claude_session_id.is_none()
-    {
+    // For channel mentions, fetch thread history every turn and prepend any
+    // messages claude hasn't seen yet — i.e., posted between the previous
+    // bot turn and this one but never @-mentioned. Covers both first
+    // activation (no prior turns; everything before the trigger is new) and
+    // mid-session interleaves (user types non-mention messages between two
+    // @-mentions). Skipped for DMs: every DM message fires a turn, so there
+    // are no interleaved non-mention messages to recover.
+    let prompt_text = if surface == Surface::ChannelMention {
         match fetch_thread_replies(&client, &channel, &thread_ts).await {
-            Ok(history) if history.len() > 1 => format_with_thread_context(&history, &prompt_text),
-            Ok(_) => prompt_text,
+            Ok(history) => {
+                let unseen: Vec<&SlackHistoryMessage> = history
+                    .iter()
+                    .filter(|m| {
+                        let ts = &m.origin.ts.0;
+                        ts.as_str() < trigger_ts.0.as_str()
+                            && entry
+                                .last_seen_ts
+                                .as_deref()
+                                .map_or(true, |last| ts.as_str() > last)
+                            && m.sender.bot_id.is_none()
+                    })
+                    .collect();
+                if unseen.is_empty() {
+                    prompt_text
+                } else {
+                    format_with_thread_context(&unseen, &prompt_text)
+                }
+            }
             Err(e) => {
                 warn!(error = %e, "failed to fetch thread context; proceeding without it");
                 prompt_text
@@ -352,7 +365,6 @@ async fn handle_full_session(
         &prompt_text,
         entry.claude_session_id.as_deref(),
         &resolved_cwd,
-        ToolMode::Full,
         Some(tx),
     )
     .await
@@ -378,6 +390,7 @@ async fn handle_full_session(
         entry.cwd = Some(resolved_cwd.to_string_lossy().to_string());
     }
     entry.last_active_unix = now_unix();
+    entry.last_seen_ts = Some(trigger_ts.0.clone());
     drop(entry);
 
     if let Err(e) = store.persist().await {
@@ -707,7 +720,7 @@ async fn fetch_thread_replies(
 /// Format prior thread messages as a text block prepended to the user's
 /// current prompt, so the claude session has context for what was being
 /// discussed before the bot was mentioned.
-fn format_with_thread_context(history: &[SlackHistoryMessage], current: &str) -> String {
+fn format_with_thread_context(history: &[&SlackHistoryMessage], current: &str) -> String {
     let mut out = String::from("[Thread context — earlier messages in this Slack thread:]\n");
     for msg in history {
         let user = msg

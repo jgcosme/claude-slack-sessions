@@ -52,21 +52,10 @@ pub struct ClaudeResult {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolMode {
-    /// Full power: `--permission-mode bypassPermissions`. All tools (Read,
-    /// Bash, Edit, MCP, etc.) execute without prompting.
-    Full,
-    /// Pure chat: `--tools ""`. The model has no tool access — no filesystem,
-    /// no Bash, no MCP, no network. Just the LLM.
-    None,
-}
-
 pub async fn run_turn(
     prompt: &str,
     resume_session_id: Option<&str>,
     cwd: &Path,
-    tool_mode: ToolMode,
     chunk_tx: Option<mpsc::Sender<String>>,
 ) -> Result<ClaudeResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut cmd = Command::new("claude");
@@ -75,15 +64,9 @@ pub async fn run_turn(
         .arg(prompt)
         .arg("--output-format")
         .arg("stream-json")
-        .arg("--verbose");
-    match tool_mode {
-        ToolMode::Full => {
-            cmd.arg("--permission-mode").arg("bypassPermissions");
-        }
-        ToolMode::None => {
-            cmd.arg("--tools").arg("");
-        }
-    }
+        .arg("--verbose")
+        .arg("--permission-mode")
+        .arg("bypassPermissions");
     if let Some(id) = resume_session_id {
         cmd.arg("--resume").arg(id);
     }
@@ -92,7 +75,6 @@ pub async fn run_turn(
     debug!(
         ?resume_session_id,
         cwd = %cwd.display(),
-        ?tool_mode,
         "spawning claude"
     );
     let mut child = cmd.spawn()?;

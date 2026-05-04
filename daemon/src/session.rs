@@ -31,6 +31,13 @@ pub struct ThreadEntry {
     pub last_active_unix: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Slack `ts` of the most recent message that triggered a turn on this
+    /// thread. Used as the lower bound for the "fetch interleaved messages
+    /// since last turn" catch-up; messages with `ts > last_seen_ts` and
+    /// `ts < current_trigger_ts` are prepended as context so claude sees
+    /// thread activity that didn't @-mention the bot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ts: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -71,6 +78,7 @@ impl SessionStore {
                     claude_session_id: None,
                     last_active_unix: now_unix(),
                     cwd: None,
+                    last_seen_ts: None,
                 }))
             })
             .clone()
