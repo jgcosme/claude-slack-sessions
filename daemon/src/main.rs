@@ -333,7 +333,7 @@ async fn handle_full_session(
                             && entry
                                 .last_seen_ts
                                 .as_deref()
-                                .map_or(true, |last| ts.as_str() > last)
+                                .is_none_or(|last| ts.as_str() > last)
                             && m.sender.bot_id.is_none()
                     })
                     .collect();
