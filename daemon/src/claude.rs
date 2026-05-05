@@ -98,9 +98,14 @@ pub async fn run_turn(
             Ok(StreamMessage::Assistant(w)) => {
                 for block in w.message.content {
                     if let ContentBlock::Text { text: t } = block {
-                        text.push_str(&t);
+                        let chunk = if text.is_empty() {
+                            t
+                        } else {
+                            format!("\n\n{}", t)
+                        };
+                        text.push_str(&chunk);
                         if let Some(tx) = chunk_tx.as_ref() {
-                            let _ = tx.send(t).await;
+                            let _ = tx.send(chunk).await;
                         }
                     }
                 }
