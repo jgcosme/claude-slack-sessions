@@ -415,14 +415,20 @@ async fn handle_full_session(
         } else {
             first_chunk.clone()
         };
-        match outcome.current_ts.as_ref() {
-            Some(ts) => update_message(&client, &channel, ts, &label).await?,
-            None => post_reply(&client, &channel, &thread_ts, &label).await?,
-        }
+        send_with_overflow_recovery(
+            &client,
+            &channel,
+            &thread_ts,
+            outcome.current_ts.as_ref(),
+            &label,
+        )
+        .await?;
         for (i, chunk) in chunks.iter().enumerate().skip(1) {
             let part_n = outcome.parts_committed + i + 1;
             let body = format!("{}\n\n_(part {})_", chunk, part_n);
-            if let Err(e) = post_reply(&client, &channel, &thread_ts, &body).await {
+            if let Err(e) =
+                send_with_overflow_recovery(&client, &channel, &thread_ts, None, &body).await
+            {
                 warn!(error = %e, part = part_n, "follow-up chunk post failed");
             }
         }
@@ -788,7 +794,7 @@ async fn post_reply(
     channel: &SlackChannelId,
     thread_ts: &SlackTs,
     text: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SlackTs, Box<dyn std::error::Error + Send + Sync>> {
     let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
     let session = client.open_session(token);
     let req = SlackApiChatPostMessageRequest::new(
@@ -796,8 +802,8 @@ async fn post_reply(
         SlackMessageContent::new().with_text(text.to_string()),
     )
     .with_thread_ts(thread_ts.clone());
-    session.chat_post_message(&req).await?;
-    Ok(())
+    let resp = session.chat_post_message(&req).await?;
+    Ok(resp.ts)
 }
 
 async fn post_placeholder(
@@ -864,6 +870,119 @@ fn chunk_for_slack(s: &str) -> Vec<String> {
         chunks.push(rest.to_string());
     }
     chunks
+}
+
+/// Returns true if `e` (or any error in its source chain) is a Slack
+/// `msg_too_long` rejection. `chat.update` and `chat.postMessage` enforce a
+/// limit on the rendered Block Kit payload — not raw bytes — so URL-heavy
+/// mrkdwn (`<URL|label>`, channel mentions) can trip this well below
+/// `SLACK_MAX_TEXT`. We treat it as a signal to split smaller and retry.
+fn is_msg_too_long_error(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if format!("{err}").contains("msg_too_long") {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
+/// Split `s` into two roughly-equal pieces at the best boundary near the
+/// midpoint: prefer `\n\n`, then `\n`, then a char boundary. Returns None if
+/// `s` is too short or no valid split point exists.
+fn split_in_half(s: &str) -> Option<(String, String)> {
+    if s.len() < 2 {
+        return None;
+    }
+    let mid = s.len() / 2;
+    let pick_closest = |head: Option<usize>, tail: Option<usize>| -> Option<usize> {
+        match (head, tail) {
+            (Some(h), Some(t)) => Some(if mid - h <= t - mid { h } else { t }),
+            (Some(h), None) => Some(h),
+            (None, Some(t)) => Some(t),
+            (None, None) => None,
+        }
+    };
+    let para = pick_closest(
+        s[..mid].rfind("\n\n").map(|i| i + 2),
+        s[mid..].find("\n\n").map(|i| mid + i + 2),
+    );
+    let line = pick_closest(
+        s[..mid].rfind('\n').map(|i| i + 1),
+        s[mid..].find('\n').map(|i| mid + i + 1),
+    );
+    let cut = para.or(line).unwrap_or_else(|| {
+        let mut p = mid;
+        while p > 0 && !s.is_char_boundary(p) {
+            p -= 1;
+        }
+        p
+    });
+    if cut == 0 || cut >= s.len() {
+        return None;
+    }
+    let head = s[..cut].trim_end().to_string();
+    let tail = s[cut..].trim_start().to_string();
+    if head.is_empty() || tail.is_empty() {
+        return None;
+    }
+    Some((head, tail))
+}
+
+/// Deliver `text` to the thread, recovering from `msg_too_long` by splitting
+/// the body in half and posting the halves as follow-up replies. If
+/// `placeholder_ts` is `Some`, the first attempt is a `chat.update` on that
+/// placeholder; otherwise it's a fresh threaded `chat.postMessage`. On a split,
+/// the head goes to the placeholder (or as a new reply) and the tail is posted
+/// as a follow-up — which itself recovers if it overflows again.
+type SendFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<SlackTs, Box<dyn std::error::Error + Send + Sync>>>
+            + Send
+            + 'a,
+    >,
+>;
+
+fn send_with_overflow_recovery<'a>(
+    client: &'a SlackHyperClient,
+    channel: &'a SlackChannelId,
+    thread_ts: &'a SlackTs,
+    placeholder_ts: Option<&'a SlackTs>,
+    text: &'a str,
+) -> SendFuture<'a> {
+    Box::pin(async move {
+        let first_attempt = match placeholder_ts {
+            Some(ts) => update_message(client, channel, ts, text)
+                .await
+                .map(|_| ts.clone()),
+            None => post_reply(client, channel, thread_ts, text).await,
+        };
+        match first_attempt {
+            Ok(ts) => Ok(ts),
+            Err(e) if is_msg_too_long_error(e.as_ref()) => {
+                let Some((head, tail)) = split_in_half(text) else {
+                    return Err(e);
+                };
+                warn!(
+                    bytes = text.len(),
+                    head_bytes = head.len(),
+                    tail_bytes = tail.len(),
+                    "msg_too_long; splitting and retrying"
+                );
+                let _ = send_with_overflow_recovery(
+                    client,
+                    channel,
+                    thread_ts,
+                    placeholder_ts,
+                    &head,
+                )
+                .await?;
+                send_with_overflow_recovery(client, channel, thread_ts, None, &tail).await
+            }
+            Err(e) => Err(e),
+        }
+    })
 }
 
 /// Post a `<@user> _done_` reply in the thread when the turn took longer than
