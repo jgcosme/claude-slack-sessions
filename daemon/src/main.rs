@@ -16,6 +16,11 @@ use crate::projects::ProjectsRegistry;
 use crate::session::{now_unix, SessionStore};
 
 const SLACK_MAX_TEXT: usize = 38_000;
+/// During streaming, once the in-flight message accumulates this many bytes,
+/// finalize it as `_(part N)_` and start a new placeholder in the same thread.
+/// Keeps each `chat.update` body well under SLACK_MAX_TEXT and gives the user
+/// progressive output across multiple messages instead of a 38 KB freeze.
+const STREAM_ROLLOVER: usize = 35_000;
 /// Wall-clock threshold above which we post a separate `<@user> _done_` reply
 /// in the thread after the final edit. `chat.update` does not fire mention
 /// notifications, so a fresh `chat.postMessage` is required to actually ping.
@@ -359,6 +364,7 @@ async fn handle_full_session(
         client.clone(),
         channel.clone(),
         placeholder_ts.clone(),
+        thread_ts.clone(),
         rx,
     ));
     let claude_result = match crate::claude::run_turn(
@@ -371,26 +377,54 @@ async fn handle_full_session(
     {
         Ok(r) => r,
         Err(e) => {
-            let _ = updater.await;
+            let outcome = updater.await.unwrap_or(StreamerOutcome {
+                current_ts: Some(placeholder_ts.clone()),
+                parts_committed: 0,
+                bytes_committed: 0,
+            });
             let err_text = format!("_claude failed:_ {}", e);
-            let _ = update_message(&client, &channel, &placeholder_ts, &err_text).await;
+            match outcome.current_ts.as_ref() {
+                Some(ts) => {
+                    let _ = update_message(&client, &channel, ts, &err_text).await;
+                }
+                None => {
+                    let _ = post_reply(&client, &channel, &thread_ts, &err_text).await;
+                }
+            }
             return Err(e);
         }
     };
-    let _ = updater.await;
+    let outcome = updater.await.unwrap_or(StreamerOutcome {
+        current_ts: Some(placeholder_ts.clone()),
+        parts_committed: 0,
+        bytes_committed: 0,
+    });
 
-    let chunks = chunk_for_slack(&claude_result.text);
-    let total = chunks.len();
-    let first = if total > 1 {
-        format!("{}\n\n_({}/{})_", chunks[0], 1, total)
+    let tail_start = outcome.bytes_committed.min(claude_result.text.len());
+    let tail = &claude_result.text[tail_start..];
+    let chunks = if tail.is_empty() {
+        Vec::new()
     } else {
-        chunks[0].clone()
+        chunk_for_slack(tail)
     };
-    update_message(&client, &channel, &placeholder_ts, &first).await?;
-    for (i, chunk) in chunks.iter().enumerate().skip(1) {
-        let body = format!("{}\n\n_({}/{})_", chunk, i + 1, total);
-        if let Err(e) = post_reply(&client, &channel, &thread_ts, &body).await {
-            warn!(error = %e, part = i + 1, total = total, "follow-up chunk post failed");
+    let multi_part = outcome.parts_committed > 0 || chunks.len() > 1;
+    if let Some(first_chunk) = chunks.first() {
+        let part_n = outcome.parts_committed + 1;
+        let label = if multi_part {
+            format!("{}\n\n_(part {})_", first_chunk, part_n)
+        } else {
+            first_chunk.clone()
+        };
+        match outcome.current_ts.as_ref() {
+            Some(ts) => update_message(&client, &channel, ts, &label).await?,
+            None => post_reply(&client, &channel, &thread_ts, &label).await?,
+        }
+        for (i, chunk) in chunks.iter().enumerate().skip(1) {
+            let part_n = outcome.parts_committed + i + 1;
+            let body = format!("{}\n\n_(part {})_", chunk, part_n);
+            if let Err(e) = post_reply(&client, &channel, &thread_ts, &body).await {
+                warn!(error = %e, part = part_n, "follow-up chunk post failed");
+            }
         }
     }
     maybe_ping_done(&client, &channel, &thread_ts, &user_id, started.elapsed()).await;
@@ -855,40 +889,62 @@ async fn maybe_ping_done(
 /// Format an in-flight update: the accumulated text so far, capped to fit in a
 /// Slack message, with a streaming-indicator suffix. The final post is handled
 /// separately by the caller using `truncate_for_slack` once the turn completes.
-fn format_interim(text: &str) -> String {
-    const SUFFIX: &str = "\n\n_…streaming_";
-    let budget = SLACK_MAX_TEXT.saturating_sub(SUFFIX.len());
+fn format_interim(text: &str, parts_committed: usize) -> String {
+    let suffix = if parts_committed == 0 {
+        "\n\n_…streaming_".to_string()
+    } else {
+        format!("\n\n_(part {}, streaming…)_", parts_committed + 1)
+    };
+    let budget = SLACK_MAX_TEXT.saturating_sub(suffix.len());
     if text.len() <= budget {
-        let mut out = String::with_capacity(text.len() + SUFFIX.len());
+        let mut out = String::with_capacity(text.len() + suffix.len());
         out.push_str(text);
-        out.push_str(SUFFIX);
+        out.push_str(&suffix);
         return out;
     }
     let mut end = budget;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    let mut out = String::with_capacity(end + SUFFIX.len());
+    let mut out = String::with_capacity(end + suffix.len());
     out.push_str(&text[..end]);
-    out.push_str(SUFFIX);
+    out.push_str(&suffix);
     out
 }
 
-/// Consume text chunks from `rx` and call `chat.update` on the placeholder
-/// message with the accumulated text so far. The first chunk posts immediately
-/// (replacing `_thinking..._`); subsequent chunks coalesce on a 1.5 s debounce
-/// to stay well under Slack's Tier 3 rate limit (~50/min/channel). The final
-/// post is the caller's responsibility — this task exits when all senders drop.
+/// What `stream_updater` reports back so the caller can land the final post
+/// on the right message and continue the part numbering.
+struct StreamerOutcome {
+    /// The most recent placeholder still showing `_…streaming_` (or `None` if
+    /// a rollover finalized perfectly at end-of-stream and no new placeholder
+    /// was opened).
+    current_ts: Option<SlackTs>,
+    /// Number of messages the streamer already finalized as `_(part N)_`.
+    parts_committed: usize,
+    /// Total bytes of `claude_result.text` already delivered to those
+    /// finalized messages — the caller's final post starts at this offset.
+    bytes_committed: usize,
+}
+
+/// Consume text chunks from `rx`, call `chat.update` on the placeholder, and
+/// roll over into a new threaded message once the in-flight body crosses
+/// `STREAM_ROLLOVER`. Subsequent chunks coalesce on a 1.5 s debounce (well
+/// under Slack's Tier 3 ~50/min/channel limit). Final post is the caller's
+/// responsibility — this task exits when all senders drop.
 async fn stream_updater(
     client: Arc<SlackHyperClient>,
     channel: SlackChannelId,
-    ts: SlackTs,
+    initial_ts: SlackTs,
+    thread_ts: SlackTs,
     mut rx: tokio::sync::mpsc::Receiver<String>,
-) {
+) -> StreamerOutcome {
     use tokio::time::{sleep_until, Duration, Instant};
     const DEBOUNCE: Duration = Duration::from_millis(1500);
 
+    let mut current_ts: Option<SlackTs> = Some(initial_ts);
     let mut accumulated = String::new();
+    let mut parts_committed: usize = 0;
+    let mut bytes_committed: usize = 0;
     let mut last_post: Option<Instant> = None;
     let mut pending = false;
 
@@ -908,6 +964,12 @@ async fn stream_updater(
                     Some(chunk) => {
                         accumulated.push_str(&chunk);
                         pending = true;
+                        if current_ts.is_none() {
+                            match post_placeholder(&client, &channel, &thread_ts).await {
+                                Ok(ts) => current_ts = Some(ts),
+                                Err(e) => warn!(error = %e, "rollover placeholder post failed"),
+                            }
+                        }
                     }
                     None => break,
                 }
@@ -918,15 +980,55 @@ async fn stream_updater(
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                let interim = format_interim(&accumulated);
-                if let Err(e) = update_message(&client, &channel, &ts, &interim).await {
-                    warn!(error = %e, "interim slack update failed");
+                while accumulated.len() > STREAM_ROLLOVER {
+                    let window = &accumulated[..STREAM_ROLLOVER];
+                    let cut = window
+                        .rfind("\n\n").map(|i| i + 2)
+                        .or_else(|| window.rfind('\n').map(|i| i + 1))
+                        .unwrap_or_else(|| {
+                            let mut e = STREAM_ROLLOVER;
+                            while !accumulated.is_char_boundary(e) {
+                                e -= 1;
+                            }
+                            e
+                        });
+                    let part_n = parts_committed + 1;
+                    let part_text = accumulated[..cut].trim_end();
+                    let final_label = format!("{}\n\n_(part {})_", part_text, part_n);
+                    if let Some(ref ts) = current_ts {
+                        if let Err(e) = update_message(&client, &channel, ts, &final_label).await {
+                            warn!(error = %e, part = part_n, "rollover finalize failed");
+                        }
+                    }
+                    parts_committed = part_n;
+                    bytes_committed += cut;
+                    accumulated = accumulated[cut..].to_string();
+                    if !accumulated.is_empty() {
+                        match post_placeholder(&client, &channel, &thread_ts).await {
+                            Ok(ts) => current_ts = Some(ts),
+                            Err(e) => {
+                                warn!(error = %e, "rollover placeholder post failed");
+                                current_ts = None;
+                                break;
+                            }
+                        }
+                    } else {
+                        current_ts = None;
+                    }
+                }
+                if let Some(ref ts) = current_ts {
+                    let interim = format_interim(&accumulated, parts_committed);
+                    if let Err(e) = update_message(&client, &channel, ts, &interim).await {
+                        warn!(error = %e, "interim slack update failed");
+                    }
                 }
                 last_post = Some(Instant::now());
                 pending = false;
             }
         }
     }
+
+    StreamerOutcome { current_ts, parts_committed, bytes_committed }
 }
 
 fn on_error(
