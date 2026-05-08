@@ -408,6 +408,27 @@ async fn handle_full_session(
         chunk_for_slack(tail)
     };
     let multi_part = outcome.parts_committed > 0 || chunks.len() > 1;
+
+    // Persist the session id BEFORE the final Slack post. If
+    // `send_with_overflow_recovery` errors out — `msg_too_long` that defeats
+    // recursive splitting, a transient network drop, anything — the JSONL
+    // transcript on disk still corresponds to a thread we'll need to resume,
+    // and orphaning it forces the next turn to start fresh with no context.
+    // Persisting first means a Slack-side failure costs us only the visible
+    // reply, not the session continuity.
+    if entry.claude_session_id.is_none() {
+        entry.claude_session_id = claude_result.session_id;
+    }
+    if is_first_turn {
+        entry.cwd = Some(resolved_cwd.to_string_lossy().to_string());
+    }
+    entry.last_active_unix = now_unix();
+    entry.last_seen_ts = Some(trigger_ts.0.clone());
+    drop(entry);
+    if let Err(e) = store.persist().await {
+        warn!(error = %e, "failed to persist session store");
+    }
+
     if let Some(first_chunk) = chunks.first() {
         let part_n = outcome.parts_committed + 1;
         let label = if multi_part {
@@ -435,19 +456,6 @@ async fn handle_full_session(
     }
     maybe_ping_done(&client, &channel, &thread_ts, &user_id, started.elapsed()).await;
 
-    if entry.claude_session_id.is_none() {
-        entry.claude_session_id = claude_result.session_id;
-    }
-    if is_first_turn {
-        entry.cwd = Some(resolved_cwd.to_string_lossy().to_string());
-    }
-    entry.last_active_unix = now_unix();
-    entry.last_seen_ts = Some(trigger_ts.0.clone());
-    drop(entry);
-
-    if let Err(e) = store.persist().await {
-        warn!(error = %e, "failed to persist session store");
-    }
     Ok(())
 }
 
