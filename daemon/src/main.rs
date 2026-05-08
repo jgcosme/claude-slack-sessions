@@ -379,8 +379,20 @@ async fn handle_full_session(
     };
     let _ = updater.await;
 
-    let display_text = truncate_for_slack(&claude_result.text);
-    update_message(&client, &channel, &placeholder_ts, &display_text).await?;
+    let chunks = chunk_for_slack(&claude_result.text);
+    let total = chunks.len();
+    let first = if total > 1 {
+        format!("{}\n\n_({}/{})_", chunks[0], 1, total)
+    } else {
+        chunks[0].clone()
+    };
+    update_message(&client, &channel, &placeholder_ts, &first).await?;
+    for (i, chunk) in chunks.iter().enumerate().skip(1) {
+        let body = format!("{}\n\n_({}/{})_", chunk, i + 1, total);
+        if let Err(e) = post_reply(&client, &channel, &thread_ts, &body).await {
+            warn!(error = %e, part = i + 1, total = total, "follow-up chunk post failed");
+        }
+    }
     maybe_ping_done(&client, &channel, &thread_ts, &user_id, started.elapsed()).await;
 
     if entry.claude_session_id.is_none() {
@@ -787,18 +799,37 @@ async fn update_message(
     Ok(())
 }
 
-fn truncate_for_slack(s: &str) -> String {
-    if s.len() <= SLACK_MAX_TEXT {
-        return s.to_string();
+/// Split `s` into chunks each at most `SLACK_MAX_TEXT` bytes, preferring
+/// paragraph (`\n\n`) breaks, then line (`\n`) breaks, then char boundaries.
+/// Reserves headroom for a chunk-indicator suffix appended by the caller.
+fn chunk_for_slack(s: &str) -> Vec<String> {
+    const SUFFIX_BUDGET: usize = 32;
+    let max = SLACK_MAX_TEXT.saturating_sub(SUFFIX_BUDGET);
+    if s.len() <= max {
+        return vec![s.to_string()];
     }
-    let mut end = SLACK_MAX_TEXT;
-    while !s.is_char_boundary(end) {
-        end -= 1;
+    let mut chunks = Vec::new();
+    let mut rest = s;
+    while rest.len() > max {
+        let window = &rest[..max];
+        let cut = window
+            .rfind("\n\n")
+            .map(|i| i + 2)
+            .or_else(|| window.rfind('\n').map(|i| i + 1))
+            .unwrap_or_else(|| {
+                let mut end = max;
+                while !rest.is_char_boundary(end) {
+                    end -= 1;
+                }
+                end
+            });
+        chunks.push(rest[..cut].trim_end().to_string());
+        rest = &rest[cut..];
     }
-    let mut t = String::with_capacity(end + 32);
-    t.push_str(&s[..end]);
-    t.push_str("\n\n_[output truncated]_");
-    t
+    if !rest.is_empty() {
+        chunks.push(rest.to_string());
+    }
+    chunks
 }
 
 /// Post a `<@user> _done_` reply in the thread when the turn took longer than
