@@ -8,6 +8,22 @@ use crate::projects::ProjectsRegistry;
 
 const LAUNCHD_LABEL: &str = "io.thinkingmachines.slack-sessions";
 
+/// Bot scopes the daemon needs to function. Keep in sync with
+/// `cli/templates/slack-app-manifest.yaml` — the `auth.test` check below
+/// reports any expected scope that the installed app token is missing,
+/// usually because the app was installed before a scope was added and
+/// needs a reinstall in the workspace.
+const EXPECTED_SCOPES: &[&str] = &[
+    "chat:write",
+    "chat:write.public",
+    "im:history",
+    "im:read",
+    "app_mentions:read",
+    "channels:history",
+    "groups:history",
+    "reactions:write",
+];
+
 pub fn run() -> Result<()> {
     println!("slack-sessions status");
     println!();
@@ -95,7 +111,28 @@ fn section_tokens() -> bool {
     }
     if let Some(token) = bot.filter(|t| !t.is_empty()) {
         match auth_test(&token) {
-            Ok(team) => println!("  [ok]   auth.test          authenticated as team `{}`", team),
+            Ok(AuthInfo { team, scopes }) => {
+                println!("  [ok]   auth.test          authenticated as team `{}`", team);
+                let missing: Vec<&str> = EXPECTED_SCOPES
+                    .iter()
+                    .copied()
+                    .filter(|s| !scopes.iter().any(|g| g == s))
+                    .collect();
+                if missing.is_empty() {
+                    println!(
+                        "  [ok]   scopes             all {} expected scopes granted",
+                        EXPECTED_SCOPES.len()
+                    );
+                } else {
+                    println!(
+                        "  [warn] scopes             missing: {}",
+                        missing.join(", ")
+                    );
+                    println!(
+                        "         → reinstall the Slack app to grant new scopes: api.slack.com/apps → your app → \"Install to Workspace\""
+                    );
+                }
+            }
             Err(e) => {
                 // Non-fatal: could be offline or curl missing. Surface as a warning.
                 println!("  [warn] auth.test          {}", e);
@@ -236,12 +273,21 @@ fn mask(s: &str) -> String {
     }
 }
 
-/// Hit Slack's `auth.test` with the bot token to verify it's still valid.
-/// Implemented via `curl` shell-out so the cli avoids an HTTP-client dep.
-fn auth_test(bot_token: &str) -> Result<String, String> {
+struct AuthInfo {
+    team: String,
+    scopes: Vec<String>,
+}
+
+/// Hit Slack's `auth.test` with the bot token to verify it's still valid
+/// and to enumerate the scopes the token currently has. Implemented via
+/// `curl -i` shell-out so the cli avoids an HTTP-client dep — `-i` includes
+/// response headers so we can read `x-oauth-scopes` (Slack returns the
+/// granted scopes there, not in the JSON body).
+fn auth_test(bot_token: &str) -> Result<AuthInfo, String> {
     let out = Command::new("curl")
         .args([
             "-sS",
+            "-i",
             "--max-time",
             "5",
             "-H",
@@ -256,12 +302,42 @@ fn auth_test(bot_token: &str) -> Result<String, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let body = String::from_utf8_lossy(&out.stdout);
-    let json: serde_json::Value = serde_json::from_str(&body)
+    let raw = String::from_utf8_lossy(&out.stdout).into_owned();
+    // `curl -i` may emit multiple header blocks (e.g., on 100-continue or
+    // 30x redirects). Take the last \r\n\r\n separator as the
+    // header/body boundary.
+    let split_at = raw.rfind("\r\n\r\n").or_else(|| raw.rfind("\n\n"));
+    let (headers, body) = match split_at {
+        Some(idx) => {
+            let body_start = idx
+                + if raw[idx..].starts_with("\r\n\r\n") {
+                    4
+                } else {
+                    2
+                };
+            (&raw[..idx], &raw[body_start..])
+        }
+        None => ("", raw.as_str()),
+    };
+    let scopes = headers
+        .lines()
+        .find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower
+                .strip_prefix("x-oauth-scopes:")
+                .map(|rest| {
+                    rest.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_default();
+    let json: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| format!("non-JSON response from Slack: {} ({})", body.trim(), e))?;
     if json["ok"] == serde_json::Value::Bool(true) {
         let team = json["team"].as_str().unwrap_or("?").to_string();
-        Ok(team)
+        Ok(AuthInfo { team, scopes })
     } else {
         let err = json["error"].as_str().unwrap_or("unknown error");
         Err(format!("Slack rejected the token: {}", err))
