@@ -1167,14 +1167,20 @@ fn on_error(
     HttpStatusCode::OK
 }
 
-/// Spawn `caffeinate -dimsu -w <our-pid>` as a detached child so macOS doesn't
-/// sleep while the daemon is running. caffeinate exits automatically when our
-/// PID dies, so no explicit teardown is needed. Best-effort: a failure is
-/// logged but doesn't stop the daemon.
+/// Spawn `caffeinate -is -w <our-pid>` as a detached child so macOS doesn't
+/// sleep the daemon's WebSocket while we're running. `-i` blocks idle sleep,
+/// `-s` blocks system sleep on AC; that's the minimum needed to keep Socket
+/// Mode connected. We deliberately omit `-d` (display sleep) and `-m` (disk
+/// idle): the daemon never touches the display, and Apple Silicon NVMe SSDs
+/// have no meaningful idle state to preserve. Dropping them saves ~3-5 W
+/// during user-away periods.
+///
+/// caffeinate exits automatically when our PID dies, so no explicit teardown
+/// is needed. Best-effort: a failure is logged but doesn't stop the daemon.
 fn spawn_caffeinate() {
     let pid = std::process::id().to_string();
     let result = std::process::Command::new("caffeinate")
-        .args(["-dimsu", "-w", &pid])
+        .args(["-is", "-w", &pid])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
