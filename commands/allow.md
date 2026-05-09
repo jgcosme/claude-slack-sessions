@@ -1,5 +1,5 @@
 ---
-description: Manage the slack-sessions allowlist of Slack user IDs that get full tool access. Without args, lists the allowlist. Subcommands: add <user-id>, list, remove <user-id>.
+description: "Manage the slack-sessions allowlist of Slack user IDs that get full tool access. Without args, lists the allowlist. Subcommands: add <user-id>, list, remove <user-id>."
 allowed-tools:
   - Bash(*/slack-sessions allow*)
 argument-hint: "add|list|remove [user-id]"

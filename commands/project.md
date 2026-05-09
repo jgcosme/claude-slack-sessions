@@ -1,5 +1,5 @@
 ---
-description: Manage the slack-sessions project registry used for `!start <name>` selection in Slack. Without args, lists registered projects. Subcommands: add <name> <path>, list, remove <name>, set-default <path>.
+description: "Manage the slack-sessions project registry used for `!start <name>` selection in Slack. Without args, lists registered projects. Subcommands: add <name> <path>, list, remove <name>, set-default <path>."
 allowed-tools:
   - Bash(*/slack-sessions project*)
 argument-hint: "add|list|remove|set-default [name] [path]"
