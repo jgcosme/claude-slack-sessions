@@ -431,6 +431,51 @@ async fn handle_full_session_inner(
         prompt_text
     };
 
+    // Surface the thread + session ids on the first turn (or after `!reset`)
+    // so they're recoverable from Slack even if claude later hangs or
+    // crashes. We post the message *before* spawning claude (capturing
+    // `thread_ts` immediately) and update it once claude reports its
+    // session id via the oneshot below.
+    let announce_first_turn = entry.claude_session_id.is_none();
+    let announce_ts = if announce_first_turn {
+        match post_reply(
+            &client,
+            &channel,
+            &thread_ts,
+            &format!("_thread `{}`; session pending..._", thread_ts.0),
+        )
+        .await
+        {
+            Ok(ts) => Some(ts),
+            Err(e) => {
+                warn!(error = %e, "failed to post thread-id announce; continuing without");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (sid_tx, sid_rx) = if announce_first_turn {
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    if let (Some(rx), Some(announce_ts)) = (sid_rx, announce_ts.clone()) {
+        let client_a = client.clone();
+        let channel_a = channel.clone();
+        let thread_ts_str = thread_ts.0.clone();
+        tokio::spawn(async move {
+            if let Ok(sid) = rx.await {
+                let body = format!("_thread `{}`; session `{}`_", thread_ts_str, sid);
+                if let Err(e) = update_message(&client_a, &channel_a, &announce_ts, &body).await {
+                    warn!(error = %e, "thread-id announce update failed");
+                }
+            }
+        });
+    }
+
     let placeholder_ts = post_placeholder(&client, &channel, &thread_ts).await?;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -446,6 +491,7 @@ async fn handle_full_session_inner(
         entry.claude_session_id.as_deref(),
         &resolved_cwd,
         Some(tx),
+        sid_tx,
     )
     .await
     {

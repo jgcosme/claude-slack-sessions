@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +63,12 @@ pub async fn run_turn(
     resume_session_id: Option<&str>,
     cwd: &Path,
     chunk_tx: Option<mpsc::Sender<String>>,
+    // Fires once with the session id as soon as claude's first stream-json
+    // `system` message arrives — typically within a couple of seconds of
+    // spawn. The caller uses this to surface the id in Slack before the
+    // rest of the turn completes, so the id is recoverable even if the
+    // turn later hangs or crashes.
+    mut session_id_tx: Option<oneshot::Sender<String>>,
 ) -> Result<ClaudeResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut cmd = Command::new("claude");
     cmd.current_dir(cwd)
@@ -100,6 +106,11 @@ pub async fn run_turn(
         match serde_json::from_str::<StreamMessage>(&line) {
             Ok(StreamMessage::System(s)) => {
                 if let Some(id) = s.session_id {
+                    if session_id.is_none() {
+                        if let Some(tx) = session_id_tx.take() {
+                            let _ = tx.send(id.clone());
+                        }
+                    }
                     session_id = Some(id);
                 }
             }
