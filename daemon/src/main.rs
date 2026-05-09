@@ -601,13 +601,15 @@ async fn handle_full_session_inner(
         return Ok(());
     }
 
-    let placeholder_ts = post_placeholder(&client, &channel, &thread_ts).await?;
+    // Show "running" via reaction in lieu of a `_thinking..._` placeholder.
+    // The wrapper's `:eyes:` is already on the message; we add an hourglass
+    // here and remove it at every exit (success, error, <done> shortcut).
+    let _ = add_reaction(&client, &channel, &trigger_ts, "hourglass_flowing_sand").await;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
     let updater = tokio::spawn(stream_updater(
         client.clone(),
         channel.clone(),
-        placeholder_ts.clone(),
         thread_ts.clone(),
         rx,
     ));
@@ -623,7 +625,7 @@ async fn handle_full_session_inner(
         Ok(r) => r,
         Err(e) => {
             let outcome = updater.await.unwrap_or(StreamerOutcome {
-                current_ts: Some(placeholder_ts.clone()),
+                current_ts: None,
                 parts_committed: 0,
                 bytes_committed: 0,
             });
@@ -636,11 +638,18 @@ async fn handle_full_session_inner(
                     let _ = post_reply(&client, &channel, &thread_ts, &err_text).await;
                 }
             }
+            let _ = remove_reaction(
+                &client,
+                &channel,
+                &trigger_ts,
+                "hourglass_flowing_sand",
+            )
+            .await;
             return Err(e);
         }
     };
     let outcome = updater.await.unwrap_or(StreamerOutcome {
-        current_ts: Some(placeholder_ts.clone()),
+        current_ts: None,
         parts_committed: 0,
         bytes_committed: 0,
     });
@@ -672,6 +681,13 @@ async fn handle_full_session_inner(
                 warn!(error = %e, "failed to delete placeholder for <done> shortcut");
             }
         }
+        let _ = remove_reaction(
+            &client,
+            &channel,
+            &trigger_ts,
+            "hourglass_flowing_sand",
+        )
+        .await;
         let _ = add_reaction(&client, &channel, &trigger_ts, "white_check_mark").await;
         return Ok(());
     }
@@ -737,6 +753,13 @@ async fn handle_full_session_inner(
             }
         }
     }
+    let _ = remove_reaction(
+        &client,
+        &channel,
+        &trigger_ts,
+        "hourglass_flowing_sand",
+    )
+    .await;
     maybe_ping_done(&client, &channel, &thread_ts, &user_id, started.elapsed()).await;
 
     Ok(())
@@ -1170,22 +1193,6 @@ async fn post_reply(
     Ok(resp.ts)
 }
 
-async fn post_placeholder(
-    client: &SlackHyperClient,
-    channel: &SlackChannelId,
-    thread_ts: &SlackTs,
-) -> Result<SlackTs, Box<dyn std::error::Error + Send + Sync>> {
-    let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
-    let session = client.open_session(token);
-    let req = SlackApiChatPostMessageRequest::new(
-        channel.clone(),
-        SlackMessageContent::new().with_text("_thinking..._".to_string()),
-    )
-    .with_thread_ts(thread_ts.clone());
-    let resp = session.chat_post_message(&req).await?;
-    Ok(resp.ts)
-}
-
 async fn update_message(
     client: &SlackHyperClient,
     channel: &SlackChannelId,
@@ -1453,22 +1460,24 @@ struct StreamerOutcome {
     bytes_committed: usize,
 }
 
-/// Consume text chunks from `rx`, call `chat.update` on the placeholder, and
-/// roll over into a new threaded message once the in-flight body crosses
-/// `STREAM_ROLLOVER`. Subsequent chunks coalesce on a 1.5 s debounce (well
-/// under Slack's Tier 3 ~50/min/channel limit). Final post is the caller's
-/// responsibility — this task exits when all senders drop.
+/// Consume text chunks from `rx` and surface them in a Slack thread, lazily
+/// posting the first message only once content arrives (no `_thinking..._`
+/// placeholder — the caller's `:hourglass_flowing_sand:` reaction conveys
+/// in-progress state). After that, subsequent chunks coalesce on a 1.5 s
+/// debounce and `chat.update` the same message. Once the in-flight body
+/// crosses `STREAM_ROLLOVER`, the message is finalized as `_(part N)_` and
+/// the next debounce tick starts a fresh message for part N+1. Stays well
+/// under Slack's Tier 3 ~50/min/channel limit.
 async fn stream_updater(
     client: Arc<SlackHyperClient>,
     channel: SlackChannelId,
-    initial_ts: SlackTs,
     thread_ts: SlackTs,
     mut rx: tokio::sync::mpsc::Receiver<String>,
 ) -> StreamerOutcome {
     use tokio::time::{sleep_until, Duration, Instant};
     const DEBOUNCE: Duration = Duration::from_millis(1500);
 
-    let mut current_ts: Option<SlackTs> = Some(initial_ts);
+    let mut current_ts: Option<SlackTs> = None;
     let mut accumulated = String::new();
     let mut parts_committed: usize = 0;
     let mut bytes_committed: usize = 0;
@@ -1491,12 +1500,6 @@ async fn stream_updater(
                     Some(chunk) => {
                         accumulated.push_str(&chunk);
                         pending = true;
-                        if current_ts.is_none() {
-                            match post_placeholder(&client, &channel, &thread_ts).await {
-                                Ok(ts) => current_ts = Some(ts),
-                                Err(e) => warn!(error = %e, "rollover placeholder post failed"),
-                            }
-                        }
                     }
                     None => break,
                 }
@@ -1523,32 +1526,37 @@ async fn stream_updater(
                     let part_text = accumulated[..cut].trim_end();
                     let converted = crate::mrkdwn::to_slack_mrkdwn(part_text);
                     let final_label = format!("{}\n\n_(part {})_", converted, part_n);
-                    if let Some(ref ts) = current_ts {
-                        if let Err(e) = update_message(&client, &channel, ts, &final_label).await {
-                            warn!(error = %e, part = part_n, "rollover finalize failed");
-                        }
+                    let result = match current_ts.as_ref() {
+                        Some(ts) => update_message(&client, &channel, ts, &final_label)
+                            .await
+                            .map(|_| ts.clone()),
+                        None => post_reply(&client, &channel, &thread_ts, &final_label).await,
+                    };
+                    if let Err(e) = result {
+                        warn!(error = %e, part = part_n, "rollover finalize failed");
                     }
                     parts_committed = part_n;
                     bytes_committed += cut;
                     accumulated = accumulated[cut..].to_string();
-                    if !accumulated.is_empty() {
-                        match post_placeholder(&client, &channel, &thread_ts).await {
-                            Ok(ts) => current_ts = Some(ts),
-                            Err(e) => {
-                                warn!(error = %e, "rollover placeholder post failed");
-                                current_ts = None;
-                                break;
-                            }
-                        }
-                    } else {
-                        current_ts = None;
-                    }
+                    // Always reset; the next tick lazily posts a fresh
+                    // message for part N+1 if accumulated still has content.
+                    current_ts = None;
                 }
-                if let Some(ref ts) = current_ts {
+                if !accumulated.is_empty() {
                     let converted = crate::mrkdwn::to_slack_mrkdwn(&accumulated);
                     let interim = format_interim(&converted, parts_committed);
-                    if let Err(e) = update_message(&client, &channel, ts, &interim).await {
-                        warn!(error = %e, "interim slack update failed");
+                    match current_ts.as_ref() {
+                        Some(ts) => {
+                            if let Err(e) = update_message(&client, &channel, ts, &interim).await {
+                                warn!(error = %e, "interim slack update failed");
+                            }
+                        }
+                        None => {
+                            match post_reply(&client, &channel, &thread_ts, &interim).await {
+                                Ok(ts) => current_ts = Some(ts),
+                                Err(e) => warn!(error = %e, "interim slack post failed"),
+                            }
+                        }
                     }
                 }
                 last_post = Some(Instant::now());
