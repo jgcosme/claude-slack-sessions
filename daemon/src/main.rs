@@ -520,6 +520,37 @@ async fn handle_full_session_inner(
         bytes_committed: 0,
     });
 
+    // `<done>` shortcut: when the model's *entire* response is the literal
+    // sentinel, treat it as a "no reply needed" signal — delete the
+    // streaming placeholder, react :white_check_mark: on the user's
+    // message, and skip the rest of the post path. Only triggers when
+    // nothing has rolled over yet (parts_committed == 0); a long response
+    // that happens to end in `<done>` falls through to normal posting.
+    let is_done_shortcut =
+        outcome.parts_committed == 0 && claude_result.text.trim() == "<done>";
+
+    if is_done_shortcut {
+        if entry.claude_session_id.is_none() {
+            entry.claude_session_id = claude_result.session_id;
+        }
+        if is_first_turn {
+            entry.cwd = Some(resolved_cwd.to_string_lossy().to_string());
+        }
+        entry.last_active_unix = now_unix();
+        entry.last_seen_ts = Some(trigger_ts.0.clone());
+        drop(entry);
+        if let Err(e) = store.persist().await {
+            warn!(error = %e, "failed to persist session store");
+        }
+        if let Some(ts) = outcome.current_ts.as_ref() {
+            if let Err(e) = delete_message(&client, &channel, ts).await {
+                warn!(error = %e, "failed to delete placeholder for <done> shortcut");
+            }
+        }
+        let _ = add_reaction(&client, &channel, &trigger_ts, "white_check_mark").await;
+        return Ok(());
+    }
+
     let tail_start = outcome.bytes_committed.min(claude_result.text.len());
     let tail = &claude_result.text[tail_start..];
     // Convert tail in one pass before chunking. Conversion is line-by-line and
@@ -1020,6 +1051,18 @@ async fn update_message(
         ts.clone(),
     );
     session.chat_update(&req).await?;
+    Ok(())
+}
+
+async fn delete_message(
+    client: &SlackHyperClient,
+    channel: &SlackChannelId,
+    ts: &SlackTs,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
+    let session = client.open_session(token);
+    let req = SlackApiChatDeleteRequest::new(channel.clone(), ts.clone());
+    session.chat_delete(&req).await?;
     Ok(())
 }
 

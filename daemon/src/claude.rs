@@ -53,10 +53,15 @@ pub struct ClaudeResult {
 }
 
 /// Tells the model where its output is going so it can phrase / size replies
-/// accordingly. Kept short on purpose — formatting (mrkdwn syntax, link
-/// rewriting) is handled deterministically by the daemon's converter, not
-/// here, since the model would drift turn-to-turn.
-const SLACK_CONTEXT_PROMPT: &str = "You are running inside the slack-sessions daemon. Your reply is auto-posted into a Slack thread. Replies over ~35 KB are auto-chunked across multiple messages.";
+/// accordingly, and instructs it on the brief-by-default response style with
+/// the `<done>` shortcut for tasks that don't need a reply.
+///
+/// Formatting (mrkdwn syntax, link rewriting) is handled deterministically by
+/// the daemon's converter, not by this prompt — model output drifts
+/// turn-to-turn and we want byte-level guarantees there. The `<done>`
+/// shortcut is a different category: a graceful UX optimization where a
+/// missed sentinel just produces the same chatty reply we'd post anyway.
+const SLACK_CONTEXT_PROMPT: &str = "You are running inside the slack-sessions daemon. Your reply is auto-posted into a Slack thread. Replies over ~35 KB are auto-chunked across multiple messages.\n\nDefault to brief. If the request is straightforward and you complete it without needing clarification, output exactly `<done>` on its own line and nothing else — the daemon will react with :white_check_mark: on the user's message and skip posting any reply. Otherwise reply normally with what was asked for: clarifications, errors, blockers, or the answer itself. Skip recaps, \"let me know if...\" follow-ups, and unsolicited suggestions.";
 
 pub async fn run_turn(
     prompt: &str,
