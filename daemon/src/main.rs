@@ -253,7 +253,41 @@ enum Surface {
     ChannelMention,
 }
 
+/// Outer wrapper that posts a `:eyes:` reaction on the user's message before
+/// queuing on the per-thread mutex, then removes it once the turn finishes
+/// (success or error). Without this, a second message arriving mid-turn has
+/// no acknowledgement and the bot looks frozen.
 async fn handle_full_session(
+    client: Arc<SlackHyperClient>,
+    channel: SlackChannelId,
+    thread_ts: SlackTs,
+    trigger_ts: SlackTs,
+    text: String,
+    user_id: String,
+    surface: Surface,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let acked = add_reaction(&client, &channel, &trigger_ts, "eyes")
+        .await
+        .is_ok();
+    let result = handle_full_session_inner(
+        client.clone(),
+        channel.clone(),
+        thread_ts,
+        trigger_ts.clone(),
+        text,
+        user_id,
+        surface,
+    )
+    .await;
+    if acked {
+        if let Err(e) = remove_reaction(&client, &channel, &trigger_ts, "eyes").await {
+            warn!(error = %e, "failed to remove ack reaction");
+        }
+    }
+    result
+}
+
+async fn handle_full_session_inner(
     client: Arc<SlackHyperClient>,
     channel: SlackChannelId,
     thread_ts: SlackTs,
@@ -844,6 +878,38 @@ async fn update_message(
         ts.clone(),
     );
     session.chat_update(&req).await?;
+    Ok(())
+}
+
+async fn add_reaction(
+    client: &SlackHyperClient,
+    channel: &SlackChannelId,
+    ts: &SlackTs,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
+    let session = client.open_session(token);
+    let req = SlackApiReactionsAddRequest::new(
+        channel.clone(),
+        SlackReactionName(name.to_string()),
+        ts.clone(),
+    );
+    session.reactions_add(&req).await?;
+    Ok(())
+}
+
+async fn remove_reaction(
+    client: &SlackHyperClient,
+    channel: &SlackChannelId,
+    ts: &SlackTs,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
+    let session = client.open_session(token);
+    let req = SlackApiReactionsRemoveRequest::new(SlackReactionName(name.to_string()))
+        .with_channel(channel.clone())
+        .with_timestamp(ts.clone());
+    session.reactions_remove(&req).await?;
     Ok(())
 }
 
