@@ -1,6 +1,7 @@
 mod allowlist;
 mod config;
 mod credentials;
+mod delete;
 mod projects;
 mod service;
 mod status;
@@ -54,6 +55,12 @@ enum Command {
     Allow {
         #[command(subcommand)]
         action: AllowAction,
+    },
+    /// Delete a bot-authored Slack message by permalink (Slack rejects with
+    /// `cant_delete_message` if the target wasn't authored by this bot).
+    Delete {
+        /// A Slack message permalink (right-click message → Copy link).
+        link: String,
     },
 }
 
@@ -138,6 +145,7 @@ fn main() -> Result<()> {
             AllowAction::List => allow_list(),
             AllowAction::Remove { user_id } => allow_remove(&user_id),
         },
+        Command::Delete { link } => delete::run(&link),
     }
 }
 

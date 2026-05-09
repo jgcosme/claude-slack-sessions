@@ -211,6 +211,37 @@ async fn on_mention_event(
     Ok(())
 }
 
+/// Parse a Slack message permalink like
+/// `https://<workspace>.slack.com/archives/<channel-id>/p<ts-no-dot>?…`
+/// into its (channel_id, ts) components. Tolerant of:
+/// - Slack's auto-link wrapping (`<URL>` or `<URL|label>`).
+/// - Trailing query/fragment.
+/// - Leading/trailing whitespace.
+///
+/// The `p`-prefixed timestamp has its decimal point removed by Slack's
+/// permalink format (e.g. `p1778209425485249` ↔ `1778209425.485249`); we
+/// re-insert the `.` before the last six digits.
+fn parse_slack_message_link(link: &str) -> Option<(SlackChannelId, SlackTs)> {
+    let trimmed = link.trim();
+    let unwrapped = trimmed
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(trimmed);
+    let url = unwrapped.split('|').next()?;
+    let bare = url.split('?').next()?.split('#').next()?;
+    let after_archives = bare.split("/archives/").nth(1)?;
+    let mut parts = after_archives.split('/');
+    let channel = parts.next()?;
+    let p_ts = parts.next()?;
+    let digits = p_ts.strip_prefix('p')?;
+    if digits.len() < 7 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let split = digits.len() - 6;
+    let ts = format!("{}.{}", &digits[..split], &digits[split..]);
+    Some((SlackChannelId(channel.to_string()), SlackTs(ts)))
+}
+
 /// Strip a leading Slack user mention like `<@U0B230S8FFS>` (typically the bot
 /// itself) and surrounding whitespace from the start of a message. Leaves the
 /// rest of the text intact, including any other mentions deeper in the message.
@@ -360,6 +391,19 @@ async fn handle_full_session_inner(
                     return Ok(());
                 }
                 MagicResult::BindAndRun { cwd, prompt } => (prompt, cwd),
+                MagicResult::Delete {
+                    channel: target_channel,
+                    ts: target_ts,
+                } => {
+                    let reply = match delete_message(&client, &target_channel, &target_ts).await
+                    {
+                        Ok(()) => "_deleted_".to_string(),
+                        Err(e) => format!("_delete failed:_ {}", e),
+                    };
+                    drop(entry);
+                    post_reply(&client, &channel, &thread_ts, &reply).await?;
+                    return Ok(());
+                }
                 MagicResult::Reset {
                     cwd: new_cwd,
                     prompt,
@@ -706,6 +750,7 @@ enum MagicCommand<'a> {
     SetDefault { path: &'a str },
     Start { name: &'a str, message: &'a str },
     Reset { project: &'a str, message: &'a str },
+    Delete { link: &'a str },
     AllowAdd { user_id: &'a str },
     AllowList,
     AllowRemove { user_id: &'a str },
@@ -727,6 +772,13 @@ enum MagicResult {
     Reset {
         cwd: Option<PathBuf>,
         prompt: Option<String>,
+    },
+    /// Attempt `chat.delete` on the resolved (channel, ts). Slack returns
+    /// `cant_delete_message` if the target wasn't authored by this bot, so
+    /// non-bot messages fail naturally with an informative error.
+    Delete {
+        channel: SlackChannelId,
+        ts: SlackTs,
     },
 }
 
@@ -782,6 +834,13 @@ fn parse_magic_command(text: &str) -> Option<Result<MagicCommand<'_>, String>> {
             let project = split.next().unwrap_or("").trim();
             let message = split.next().unwrap_or("").trim();
             Some(Ok(MagicCommand::Reset { project, message }))
+        }
+        "delete" => {
+            if args.is_empty() {
+                Some(Err("usage: `!delete <slack-message-link>`".into()))
+            } else {
+                Some(Ok(MagicCommand::Delete { link: args }))
+            }
         }
         "allow" => {
             let mut split = args.splitn(2, char::is_whitespace);
@@ -851,6 +910,13 @@ fn execute_magic_command(cmd: MagicCommand<'_>, is_first_turn: bool) -> MagicRes
                 }
             }
         }
+        MagicCommand::Delete { link } => match parse_slack_message_link(link) {
+            Some((channel, ts)) => MagicResult::Delete { channel, ts },
+            None => MagicResult::Reject(
+                "_couldn't parse that as a Slack message link — expected `https://<workspace>.slack.com/archives/<channel>/p<ts>`_"
+                    .into(),
+            ),
+        },
         MagicCommand::Reset { project, message } => {
             if project.is_empty() {
                 if !message.is_empty() {
@@ -1039,6 +1105,7 @@ fn format_help() -> String {
     out.push_str("• `!start <project> [<message>]` on the *first* message of a thread → bind that thread to a registered project's directory.\n");
     out.push_str("• `!reset` → clear the thread's session and start fresh on the next message (keeps `cwd`). `!reset <project> [<message>]` to also rebind.\n");
     out.push_str("• `!silent <message>` → run silently — reactions only (:eyes: → :white_check_mark: / :x:), no streaming or final reply. Composes with `!start`: `!silent !start <project> <message>`.\n");
+    out.push_str("• `!delete <slack-message-link>` → delete a bot-authored message by permalink (Slack rejects with `cant_delete_message` if the target wasn't authored by the bot).\n");
     out.push_str("\n*Registry commands* (allowlisted senders only, no Claude spawn):\n");
     out.push_str("• `!list` — show registered projects + default working directory\n");
     out.push_str("• `!add <name> <path>` — register a project (path can use `~`)\n");
