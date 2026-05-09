@@ -52,6 +52,12 @@ pub struct ClaudeResult {
     pub text: String,
 }
 
+/// Tells the model where its output is going so it can phrase / size replies
+/// accordingly. Kept short on purpose — formatting (mrkdwn syntax, link
+/// rewriting) is handled deterministically by the daemon's converter, not
+/// here, since the model would drift turn-to-turn.
+const SLACK_CONTEXT_PROMPT: &str = "You are running inside the slack-sessions daemon. Your reply is auto-posted into a Slack thread. Replies over ~35 KB are auto-chunked across multiple messages.";
+
 pub async fn run_turn(
     prompt: &str,
     resume_session_id: Option<&str>,
@@ -65,6 +71,8 @@ pub async fn run_turn(
         .arg("--output-format")
         .arg("stream-json")
         .arg("--verbose")
+        .arg("--append-system-prompt")
+        .arg(SLACK_CONTEXT_PROMPT)
         .arg("--permission-mode")
         .arg("bypassPermissions");
     if let Some(id) = resume_session_id {

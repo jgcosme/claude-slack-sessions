@@ -2,6 +2,7 @@ mod allowlist;
 mod claude;
 mod config;
 mod credentials;
+mod mrkdwn;
 mod projects;
 mod session;
 
@@ -475,10 +476,17 @@ async fn handle_full_session_inner(
 
     let tail_start = outcome.bytes_committed.min(claude_result.text.len());
     let tail = &claude_result.text[tail_start..];
-    let chunks = if tail.is_empty() {
+    // Convert tail in one pass before chunking. Conversion is line-by-line and
+    // preserves paragraph/line breaks, so chunking on `\n\n` still works.
+    let converted_tail = if tail.is_empty() {
+        String::new()
+    } else {
+        crate::mrkdwn::to_slack_mrkdwn(tail)
+    };
+    let chunks = if converted_tail.is_empty() {
         Vec::new()
     } else {
-        chunk_for_slack(tail)
+        chunk_for_slack(&converted_tail)
     };
     let multi_part = outcome.parts_committed > 0 || chunks.len() > 1;
 
@@ -1275,7 +1283,8 @@ async fn stream_updater(
                         });
                     let part_n = parts_committed + 1;
                     let part_text = accumulated[..cut].trim_end();
-                    let final_label = format!("{}\n\n_(part {})_", part_text, part_n);
+                    let converted = crate::mrkdwn::to_slack_mrkdwn(part_text);
+                    let final_label = format!("{}\n\n_(part {})_", converted, part_n);
                     if let Some(ref ts) = current_ts {
                         if let Err(e) = update_message(&client, &channel, ts, &final_label).await {
                             warn!(error = %e, part = part_n, "rollover finalize failed");
@@ -1298,7 +1307,8 @@ async fn stream_updater(
                     }
                 }
                 if let Some(ref ts) = current_ts {
-                    let interim = format_interim(&accumulated, parts_committed);
+                    let converted = crate::mrkdwn::to_slack_mrkdwn(&accumulated);
+                    let interim = format_interim(&converted, parts_committed);
                     if let Err(e) = update_message(&client, &channel, ts, &interim).await {
                         warn!(error = %e, "interim slack update failed");
                     }
