@@ -337,6 +337,45 @@ async fn handle_full_session_inner(
                     return Ok(());
                 }
                 MagicResult::BindAndRun { cwd, prompt } => (prompt, cwd),
+                MagicResult::Reset {
+                    cwd: new_cwd,
+                    prompt,
+                } => {
+                    entry.claude_session_id = None;
+                    if let Some(ref c) = new_cwd {
+                        entry.cwd = Some(c.to_string_lossy().to_string());
+                    }
+                    entry.last_active_unix = now_unix();
+                    match prompt {
+                        None => {
+                            let cwd_display = entry
+                                .cwd
+                                .clone()
+                                .unwrap_or_else(|| "(default)".to_string());
+                            drop(entry);
+                            store.persist().await.ok();
+                            post_reply(
+                                &client,
+                                &channel,
+                                &thread_ts,
+                                &format!(
+                                    "_Session reset. Bound to `{}`. Send your prompt._",
+                                    cwd_display
+                                ),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Some(p) => {
+                            let resolved = entry
+                                .cwd
+                                .clone()
+                                .map(PathBuf::from)
+                                .unwrap_or_else(default_cwd);
+                            (p, resolved)
+                        }
+                    }
+                }
             },
             Err(hint) => {
                 post_reply(&client, &channel, &thread_ts, &format!("_{}_", hint)).await?;
@@ -500,6 +539,7 @@ enum MagicCommand<'a> {
     Remove { name: &'a str },
     SetDefault { path: &'a str },
     Start { name: &'a str, message: &'a str },
+    Reset { project: &'a str, message: &'a str },
     AllowAdd { user_id: &'a str },
     AllowList,
     AllowRemove { user_id: &'a str },
@@ -514,6 +554,14 @@ enum MagicResult {
     BindAndRun { cwd: PathBuf, prompt: String },
     /// Post a hint and stop (e.g. unknown project, wrong turn).
     Reject(String),
+    /// Clear the thread's claude session id so the next turn starts fresh.
+    /// `cwd` rebinds the working directory if `Some` (otherwise keep current).
+    /// `prompt` runs claude with that prompt on this turn if `Some` (otherwise
+    /// just post a confirmation and stop).
+    Reset {
+        cwd: Option<PathBuf>,
+        prompt: Option<String>,
+    },
 }
 
 /// Returns:
@@ -562,6 +610,12 @@ fn parse_magic_command(text: &str) -> Option<Result<MagicCommand<'_>, String>> {
             } else {
                 Some(Ok(MagicCommand::Start { name, message }))
             }
+        }
+        "reset" => {
+            let mut split = args.splitn(2, char::is_whitespace);
+            let project = split.next().unwrap_or("").trim();
+            let message = split.next().unwrap_or("").trim();
+            Some(Ok(MagicCommand::Reset { project, message }))
         }
         "allow" => {
             let mut split = args.splitn(2, char::is_whitespace);
@@ -629,6 +683,39 @@ fn execute_magic_command(cmd: MagicCommand<'_>, is_first_turn: bool) -> MagicRes
                     cwd,
                     prompt: message.to_string(),
                 }
+            }
+        }
+        MagicCommand::Reset { project, message } => {
+            if project.is_empty() {
+                if !message.is_empty() {
+                    return MagicResult::Reject(
+                        "_usage: `!reset` (clear session, keep cwd) or `!reset <project> [<message>]`_"
+                            .into(),
+                    );
+                }
+                return MagicResult::Reset {
+                    cwd: None,
+                    prompt: None,
+                };
+            }
+            let registry = ProjectsRegistry::load().unwrap_or_default();
+            let cwd = match registry.lookup(project) {
+                Some(p) => p,
+                None => {
+                    return MagicResult::Reject(format!(
+                        "_No project named `{}`. Try `!list` to see registered projects._",
+                        project
+                    ))
+                }
+            };
+            let prompt = if message.is_empty() {
+                None
+            } else {
+                Some(message.to_string())
+            };
+            MagicResult::Reset {
+                cwd: Some(cwd),
+                prompt,
             }
         }
     }
@@ -784,6 +871,7 @@ fn format_help() -> String {
     out.push_str("• Top-level DM → starts a new Claude session in the default working directory.\n");
     out.push_str("• Reply in the thread → resumes that session.\n");
     out.push_str("• `!start <project> [<message>]` on the *first* message of a thread → bind that thread to a registered project's directory.\n");
+    out.push_str("• `!reset` → clear the thread's session and start fresh on the next message (keeps `cwd`). `!reset <project> [<message>]` to also rebind.\n");
     out.push_str("\n*Registry commands* (allowlisted senders only, no Claude spawn):\n");
     out.push_str("• `!list` — show registered projects + default working directory\n");
     out.push_str("• `!add <name> <path>` — register a project (path can use `~`)\n");
