@@ -302,6 +302,28 @@ async fn handle_full_session_inner(
         .get()
         .ok_or("session store not initialized")?
         .clone();
+
+    // `!silent` prefix → suppress placeholder/streaming/final reply for the
+    // claude turn. Reactions on the user's message convey status. Composes
+    // with magic-command prefixes: `!silent !start <project> <msg>` works.
+    // Magic-command replies that produce structured output (lists, binds,
+    // errors) are always shown, since silencing them would hide the entire
+    // response.
+    let (silent, text) = match text.strip_prefix("!silent ") {
+        Some(rest) => (true, rest.trim_start().to_string()),
+        None if text.trim() == "!silent" => {
+            post_reply(
+                &client,
+                &channel,
+                &thread_ts,
+                "_`!silent` needs a message after the prefix._",
+            )
+            .await?;
+            return Ok(());
+        }
+        None => (false, text),
+    };
+
     let entry_arc = store.get_or_create(&thread_ts.0).await;
     let mut entry = entry_arc.lock().await;
 
@@ -474,6 +496,65 @@ async fn handle_full_session_inner(
                 }
             }
         });
+    }
+
+    if silent {
+        // Show "running" via reaction in lieu of the streaming placeholder.
+        // The wrapper's `:eyes:` is already on the message; this adds an
+        // hourglass that we swap for `:white_check_mark:` / `:x:` at the end.
+        let _ = add_reaction(&client, &channel, &trigger_ts, "hourglass_flowing_sand").await;
+
+        let claude_result = match crate::claude::run_turn(
+            &prompt_text,
+            entry.claude_session_id.as_deref(),
+            &resolved_cwd,
+            None,
+            sid_tx,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = remove_reaction(
+                    &client,
+                    &channel,
+                    &trigger_ts,
+                    "hourglass_flowing_sand",
+                )
+                .await;
+                let _ = post_reply(
+                    &client,
+                    &channel,
+                    &thread_ts,
+                    &format!("_claude failed:_ {}", e),
+                )
+                .await;
+                let _ = add_reaction(&client, &channel, &trigger_ts, "x").await;
+                return Err(e);
+            }
+        };
+
+        if entry.claude_session_id.is_none() {
+            entry.claude_session_id = claude_result.session_id;
+        }
+        if is_first_turn {
+            entry.cwd = Some(resolved_cwd.to_string_lossy().to_string());
+        }
+        entry.last_active_unix = now_unix();
+        entry.last_seen_ts = Some(trigger_ts.0.clone());
+        drop(entry);
+        if let Err(e) = store.persist().await {
+            warn!(error = %e, "failed to persist session store");
+        }
+        let _ = remove_reaction(
+            &client,
+            &channel,
+            &trigger_ts,
+            "hourglass_flowing_sand",
+        )
+        .await;
+        let _ = add_reaction(&client, &channel, &trigger_ts, "white_check_mark").await;
+        return Ok(());
     }
 
     let placeholder_ts = post_placeholder(&client, &channel, &thread_ts).await?;
@@ -957,6 +1038,7 @@ fn format_help() -> String {
     out.push_str("• Reply in the thread → resumes that session.\n");
     out.push_str("• `!start <project> [<message>]` on the *first* message of a thread → bind that thread to a registered project's directory.\n");
     out.push_str("• `!reset` → clear the thread's session and start fresh on the next message (keeps `cwd`). `!reset <project> [<message>]` to also rebind.\n");
+    out.push_str("• `!silent <message>` → run silently — reactions only (:eyes: → :white_check_mark: / :x:), no streaming or final reply. Composes with `!start`: `!silent !start <project> <message>`.\n");
     out.push_str("\n*Registry commands* (allowlisted senders only, no Claude spawn):\n");
     out.push_str("• `!list` — show registered projects + default working directory\n");
     out.push_str("• `!add <name> <path>` — register a project (path can use `~`)\n");
