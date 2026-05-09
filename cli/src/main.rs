@@ -159,7 +159,7 @@ fn setup_interactive() -> Result<()> {
     println!("                          scopes (set by the manifest, listed for reference):");
     println!("                          chat:write, chat:write.public, im:history, im:read,");
     println!("                          app_mentions:read, channels:history, groups:history,");
-    println!("                          reactions:write");
+    println!("                          reactions:write, im:write");
     println!();
     println!("Tokens write to ~/.config/slack-sessions/credentials.json (mode 0600).");
     println!("Press Enter at a prompt to keep an existing stored value.");

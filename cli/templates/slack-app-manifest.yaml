@@ -22,6 +22,7 @@ oauth_config:
       - channels:history
       - groups:history
       - reactions:write
+      - im:write
 
 settings:
   event_subscriptions:

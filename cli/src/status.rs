@@ -22,6 +22,7 @@ const EXPECTED_SCOPES: &[&str] = &[
     "channels:history",
     "groups:history",
     "reactions:write",
+    "im:write",
 ];
 
 pub fn run() -> Result<()> {

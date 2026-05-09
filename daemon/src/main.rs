@@ -499,25 +499,15 @@ async fn handle_full_session_inner(
 
     // Surface the thread + session ids on the first turn (or after `!reset`)
     // so they're recoverable from Slack even if claude later hangs or
-    // crashes. We post the message *before* spawning claude (capturing
+    // crashes. For DM-originated turns the announce stays in the same
+    // thread; for channel-mention turns the announce is DM'd to the user
+    // instead so the channel thread doesn't get cluttered with
+    // bookkeeping. We post the message *before* spawning claude (capturing
     // `thread_ts` immediately) and update it once claude reports its
     // session id via the oneshot below.
     let announce_first_turn = entry.claude_session_id.is_none();
-    let announce_ts = if announce_first_turn {
-        match post_reply(
-            &client,
-            &channel,
-            &thread_ts,
-            &format!("_thread `{}`; session pending..._", thread_ts.0),
-        )
-        .await
-        {
-            Ok(ts) => Some(ts),
-            Err(e) => {
-                warn!(error = %e, "failed to post thread-id announce; continuing without");
-                None
-            }
-        }
+    let announce: Option<AnnounceSpec> = if announce_first_turn {
+        post_announce(&client, &channel, &thread_ts, &user_id, surface).await
     } else {
         None
     };
@@ -528,14 +518,14 @@ async fn handle_full_session_inner(
     } else {
         (None, None)
     };
-    if let (Some(rx), Some(announce_ts)) = (sid_rx, announce_ts.clone()) {
+    if let (Some(rx), Some(spec)) = (sid_rx, announce.clone()) {
         let client_a = client.clone();
-        let channel_a = channel.clone();
-        let thread_ts_str = thread_ts.0.clone();
         tokio::spawn(async move {
             if let Ok(sid) = rx.await {
-                let body = format!("_thread `{}`; session `{}`_", thread_ts_str, sid);
-                if let Err(e) = update_message(&client_a, &channel_a, &announce_ts, &body).await {
+                let body = format!("_{}; session `{}`_", spec.thread_label, sid);
+                if let Err(e) =
+                    update_message(&client_a, &spec.channel, &spec.ts, &body).await
+                {
                     warn!(error = %e, "thread-id announce update failed");
                 }
             }
@@ -1208,6 +1198,136 @@ async fn update_message(
     );
     session.chat_update(&req).await?;
     Ok(())
+}
+
+/// Post a fresh top-level message (no `thread_ts`). Used for the
+/// channel-mention DM-redirect path where the announce lands as a new DM
+/// from the bot, not threaded under anything.
+async fn post_message(
+    client: &SlackHyperClient,
+    channel: &SlackChannelId,
+    text: &str,
+) -> Result<SlackTs, Box<dyn std::error::Error + Send + Sync>> {
+    let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
+    let session = client.open_session(token);
+    let req = SlackApiChatPostMessageRequest::new(
+        channel.clone(),
+        SlackMessageContent::new().with_text(text.to_string()),
+    );
+    let resp = session.chat_post_message(&req).await?;
+    Ok(resp.ts)
+}
+
+/// Open (or reuse) the IM channel between this bot and `user_id`.
+/// Requires the `im:write` scope.
+async fn open_im_with(
+    client: &SlackHyperClient,
+    user_id: &str,
+) -> Result<SlackChannelId, Box<dyn std::error::Error + Send + Sync>> {
+    let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
+    let session = client.open_session(token);
+    let req = SlackApiConversationsOpenRequest::new()
+        .with_users(vec![SlackUserId(user_id.to_string())]);
+    let resp = session.conversations_open(&req).await?;
+    Ok(resp.channel.id)
+}
+
+/// Resolve a Slack permalink for `(channel, message_ts)`. Returns the
+/// permalink as a plain string (mrkdwn formatting is the caller's job).
+async fn get_permalink(
+    client: &SlackHyperClient,
+    channel: &SlackChannelId,
+    message_ts: &SlackTs,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let token = BOT_TOKEN.get().ok_or("bot token not initialized")?;
+    let session = client.open_session(token);
+    let req = SlackApiChatGetPermalinkRequest::new(channel.clone(), message_ts.clone());
+    let resp = session.chat_get_permalink(&req).await?;
+    Ok(resp.permalink.to_string())
+}
+
+/// Where the thread+session announce was posted, plus the mrkdwn label
+/// the updater task uses when patching it with the session id.
+#[derive(Clone)]
+struct AnnounceSpec {
+    channel: SlackChannelId,
+    ts: SlackTs,
+    /// Either a backticked `<ts>` (DM surface) or a Slack permalink
+    /// rendered as `<URL|thread>` (channel-mention surface). Spliced into
+    /// the body when the session id arrives.
+    thread_label: String,
+}
+
+/// Post the initial thread+session announce. For DM-originated turns this
+/// goes in-thread; for channel-mention turns it's DM'd to the user
+/// instead, with a permalink back to the original thread. Returns the
+/// place to patch when the session id later arrives, or None if the
+/// announce couldn't be delivered (logged and treated as best-effort —
+/// the turn still proceeds).
+async fn post_announce(
+    client: &SlackHyperClient,
+    src_channel: &SlackChannelId,
+    thread_ts: &SlackTs,
+    user_id: &str,
+    surface: Surface,
+) -> Option<AnnounceSpec> {
+    if let Surface::ChannelMention = surface {
+        if let Some(spec) =
+            post_announce_via_dm(client, src_channel, thread_ts, user_id).await
+        {
+            return Some(spec);
+        }
+        // Fall through to in-thread as a last resort — better noisy
+        // than silent.
+    }
+    let label = format!("thread `{}`", thread_ts.0);
+    let body = format!("_{}; session pending..._", label);
+    match post_reply(client, src_channel, thread_ts, &body).await {
+        Ok(ts) => Some(AnnounceSpec {
+            channel: src_channel.clone(),
+            ts,
+            thread_label: label,
+        }),
+        Err(e) => {
+            warn!(error = %e, "failed to post in-thread announce");
+            None
+        }
+    }
+}
+
+async fn post_announce_via_dm(
+    client: &SlackHyperClient,
+    src_channel: &SlackChannelId,
+    thread_ts: &SlackTs,
+    user_id: &str,
+) -> Option<AnnounceSpec> {
+    let permalink = match get_permalink(client, src_channel, thread_ts).await {
+        Ok(url) => url,
+        Err(e) => {
+            warn!(error = %e, "failed to resolve thread permalink");
+            return None;
+        }
+    };
+    let label = format!("<{}|thread>", permalink);
+    let body = format!("_{}; session pending..._", label);
+    let im_channel = match open_im_with(client, user_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "failed to open IM with user for announce");
+            return None;
+        }
+    };
+    match post_message(client, &im_channel, &body).await {
+        Ok(ts) => Some(AnnounceSpec {
+            channel: im_channel,
+            ts,
+            thread_label: label,
+        }),
+        Err(e) => {
+            warn!(error = %e, "failed to post DM announce");
+            None
+        }
+    }
 }
 
 async fn delete_message(
