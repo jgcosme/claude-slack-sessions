@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -82,6 +82,44 @@ impl SessionStore {
                 }))
             })
             .clone()
+    }
+
+    /// Returns the set of `claude_session_id`s currently bound to a Slack
+    /// thread. Used by `!session list` to mark which on-disk sessions are
+    /// already attached.
+    pub async fn known_session_ids(&self) -> HashSet<String> {
+        let map = self.threads.lock().await;
+        let mut out = HashSet::new();
+        for entry_arc in map.values() {
+            let entry = entry_arc.lock().await;
+            if let Some(sid) = &entry.claude_session_id {
+                out.insert(sid.clone());
+            }
+        }
+        out
+    }
+
+    /// Returns true if any thread other than `current_thread_ts` is bound to
+    /// the given `session_id`. Used by `!session resume` to refuse binding
+    /// the current thread to a session that's already being driven from
+    /// elsewhere, which would create the same concurrent-ownership problem
+    /// issue #3 fixes for the daemon-vs-interactive case.
+    pub async fn session_bound_elsewhere(
+        &self,
+        session_id: &str,
+        current_thread_ts: &str,
+    ) -> bool {
+        let map = self.threads.lock().await;
+        for (ts, entry_arc) in map.iter() {
+            if ts == current_thread_ts {
+                continue;
+            }
+            let entry = entry_arc.lock().await;
+            if entry.claude_session_id.as_deref() == Some(session_id) {
+                return true;
+            }
+        }
+        false
     }
 
     pub async fn persist(&self) -> std::io::Result<()> {

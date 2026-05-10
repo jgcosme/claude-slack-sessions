@@ -57,6 +57,7 @@ Other slash commands (all wrap the `slack-sessions` CLI):
 | `/slack-sessions:allow <verb>` | Manage the Slack user_id allowlist |
 | `/slack-sessions:project <verb>` | Manage the project registry |
 | `/slack-sessions:delete <link>` | Delete a bot-authored Slack message by permalink (clean up after the bot from the terminal) |
+| `/slack-sessions:sessions [list\|resume <id>]` | List claude sessions on disk, or `exec` `claude --resume <id>` in the right cwd to continue a Slack-driven session interactively |
 
 ## Slack-side commands
 
@@ -77,11 +78,24 @@ In a DM with the bot (or as the @mention text in a channel where it's been added
 **Project registry**:
 
 ```
-!list                        # show registered projects + default cwd
-!add <name> <path>           # register a project (supports ~)
-!remove <name>  (or !rm)     # remove a project
-!set-default <path>          # default working dir for unprefixed DMs
+!projects                       # (or !projects list) show registered projects + default cwd
+!projects add <name> <path>     # register a project (supports ~)
+!projects remove <name>         # remove a project
+!projects set-default <path>    # default working dir for unprefixed DMs
 ```
+
+**Sessions** — list and resume any claude session, regardless of whether it started in Slack or in a terminal:
+
+```
+!sessions                         # (or !sessions list) list claude sessions on disk —
+                                  #   shows session-id, true cwd, recency, and a `slack` tag
+                                  #   for ones already bound to a Slack thread (top 30 by recency)
+!sessions resume <session-id>     # bind THIS thread to an existing claude session (first turn only).
+                                  #   Refuses if the session is already bound to another Slack thread
+                                  #   or held by a live `claude --resume` elsewhere.
+```
+
+To go the other direction (Slack → terminal), grab the session-id from the announce posted on a thread's first turn and run `claude --resume <id>` locally — though see issue #3 for the concurrent-ownership footgun (the daemon now refuses to spawn a turn if it sees another claude holding the session, instead of silently failing).
 
 **Allowlist** (allowlisted users only):
 

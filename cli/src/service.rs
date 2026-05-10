@@ -106,6 +106,21 @@ pub fn logs(follow: bool, lines: u32) -> Result<()> {
             log_path.display()
         ));
     }
+    // `--follow` runs `tail -f` indefinitely. In a non-tty (Claude Code's
+    // Bash tool, CI, anything piped) it just dumps streaming output until
+    // the parent times out — useless and noisy. Refuse upfront and tell
+    // the user how to do this from a real terminal.
+    if follow {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() {
+            return Err(anyhow!(
+                "`logs --follow` needs a real terminal — `tail -f` would run until the parent times out.\n\
+                 Open a terminal and run: slack-sessions logs --follow\n\
+                 (or drop --follow to just print the last {} lines)",
+                lines
+            ));
+        }
+    }
     let mut cmd = Command::new("tail");
     cmd.args(["-n", &lines.to_string()]);
     if follow {

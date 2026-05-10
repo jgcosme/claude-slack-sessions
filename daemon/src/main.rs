@@ -2,6 +2,7 @@ mod allowlist;
 mod claude;
 mod config;
 mod credentials;
+mod discovery;
 mod mrkdwn;
 mod projects;
 mod session;
@@ -363,6 +364,91 @@ async fn handle_full_session_inner(
     // Resolve prompt + cwd via either a magic command (`!start ...` etc.) or the default path.
     let (prompt_text, resolved_cwd) = if let Some(parsed) = parse_magic_command(&text) {
         match parsed {
+            Ok(MagicCommand::SessionList) => {
+                let bound = store.known_session_ids().await;
+                let reply = format_session_list(&bound);
+                drop(entry);
+                post_reply(&client, &channel, &thread_ts, &reply).await?;
+                return Ok(());
+            }
+            Ok(MagicCommand::SessionResume { session_id }) => {
+                if !is_first_turn {
+                    drop(entry);
+                    post_reply(
+                        &client,
+                        &channel,
+                        &thread_ts,
+                        "_This thread is already bound. DM a fresh top-level message and try `!sessions resume <id>` there, or `!reset` first._",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let cwd = match crate::discovery::find_session_cwd(session_id) {
+                    Some(p) => p,
+                    None => {
+                        drop(entry);
+                        post_reply(
+                            &client,
+                            &channel,
+                            &thread_ts,
+                            &format!(
+                                "_No session `{}` found on disk. Try `!sessions list` to see candidates._",
+                                session_id
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                if store
+                    .session_bound_elsewhere(session_id, &thread_ts.0)
+                    .await
+                {
+                    drop(entry);
+                    post_reply(
+                        &client,
+                        &channel,
+                        &thread_ts,
+                        &format!(
+                            "_Session `{}` is already bound to another Slack thread. Resuming it here would create a concurrent-ownership conflict (issue #3)._",
+                            session_id
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                if crate::claude::session_is_busy(&cwd, session_id) {
+                    drop(entry);
+                    post_reply(
+                        &client,
+                        &channel,
+                        &thread_ts,
+                        &format!(
+                            "_Session `{}` is currently held by another `claude --resume`. Exit that terminal and retry._",
+                            session_id
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                entry.cwd = Some(cwd.to_string_lossy().to_string());
+                entry.claude_session_id = Some(session_id.to_string());
+                entry.last_active_unix = now_unix();
+                let cwd_display = cwd.display().to_string();
+                drop(entry);
+                store.persist().await.ok();
+                post_reply(
+                    &client,
+                    &channel,
+                    &thread_ts,
+                    &format!(
+                        "_Resumed session `{}` (cwd `{}`). Send your next prompt in this thread._",
+                        session_id, cwd_display
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
             Ok(cmd) => match execute_magic_command(cmd, is_first_turn) {
                 MagicResult::ReplyOnly(reply) => {
                     post_reply(&client, &channel, &thread_ts, &reply).await?;
@@ -784,6 +870,8 @@ enum MagicCommand<'a> {
     AllowAdd { user_id: &'a str },
     AllowList,
     AllowRemove { user_id: &'a str },
+    SessionList,
+    SessionResume { session_id: &'a str },
 }
 
 enum MagicResult {
@@ -823,32 +911,66 @@ fn parse_magic_command(text: &str) -> Option<Result<MagicCommand<'_>, String>> {
     let cmd = parts.next()?.trim();
     let args = parts.next().unwrap_or("").trim();
     match cmd {
-        "list" => Some(Ok(MagicCommand::List)),
         "help" => Some(Ok(MagicCommand::Help)),
-        "add" => {
+        "projects" => {
             let mut split = args.splitn(2, char::is_whitespace);
-            let name = split.next().unwrap_or("").trim();
-            let path = split.next().unwrap_or("").trim();
-            if name.is_empty() || path.is_empty() {
-                Some(Err("usage: `!add <name> <path>`".into()))
-            } else {
-                Some(Ok(MagicCommand::Add { name, path }))
+            let sub = split.next().unwrap_or("").trim();
+            let rest = split.next().unwrap_or("").trim();
+            match sub {
+                "" | "list" => Some(Ok(MagicCommand::List)),
+                "add" => {
+                    let mut p = rest.splitn(2, char::is_whitespace);
+                    let name = p.next().unwrap_or("").trim();
+                    let path = p.next().unwrap_or("").trim();
+                    if name.is_empty() || path.is_empty() {
+                        Some(Err("usage: `!projects add <name> <path>`".into()))
+                    } else {
+                        Some(Ok(MagicCommand::Add { name, path }))
+                    }
+                }
+                "remove" | "rm" => {
+                    if rest.is_empty() {
+                        Some(Err("usage: `!projects remove <name>`".into()))
+                    } else {
+                        Some(Ok(MagicCommand::Remove { name: rest }))
+                    }
+                }
+                "set-default" => {
+                    if rest.is_empty() {
+                        Some(Err("usage: `!projects set-default <path>`".into()))
+                    } else {
+                        Some(Ok(MagicCommand::SetDefault { path: rest }))
+                    }
+                }
+                _ => Some(Err(
+                    "usage: `!projects list|add|remove|set-default ...`".into(),
+                )),
             }
         }
-        "remove" | "rm" => {
-            if args.is_empty() {
-                Some(Err("usage: `!remove <name>`".into()))
-            } else {
-                Some(Ok(MagicCommand::Remove { name: args }))
+        "sessions" => {
+            let mut split = args.splitn(2, char::is_whitespace);
+            let sub = split.next().unwrap_or("").trim();
+            let rest = split.next().unwrap_or("").trim();
+            match sub {
+                "" | "list" => Some(Ok(MagicCommand::SessionList)),
+                "resume" => {
+                    if rest.is_empty() {
+                        Some(Err("usage: `!sessions resume <session-id>`".into()))
+                    } else {
+                        Some(Ok(MagicCommand::SessionResume { session_id: rest }))
+                    }
+                }
+                _ => Some(Err("usage: `!sessions list|resume <session-id>`".into())),
             }
         }
-        "set-default" => {
-            if args.is_empty() {
-                Some(Err("usage: `!set-default <path>`".into()))
-            } else {
-                Some(Ok(MagicCommand::SetDefault { path: args }))
-            }
-        }
+        // Compat hints — these used to be top-level. Direct users to the new
+        // namespaced form rather than silently passing through to claude.
+        "list" => Some(Err("renamed: use `!projects list`".into())),
+        "add" => Some(Err("renamed: use `!projects add <name> <path>`".into())),
+        "remove" | "rm" => Some(Err(
+            "renamed: use `!projects remove <name>` (or `!allow remove <user-id>`)".into(),
+        )),
+        "set-default" => Some(Err("renamed: use `!projects set-default <path>`".into())),
         "start" => {
             let mut split = args.splitn(2, char::is_whitespace);
             let name = split.next().unwrap_or("").trim();
@@ -926,7 +1048,7 @@ fn execute_magic_command(cmd: MagicCommand<'_>, is_first_turn: bool) -> MagicRes
                 Some(p) => p,
                 None => {
                     return MagicResult::Reject(format!(
-                        "_No project named `{}`. Try `!list` to see registered projects._",
+                        "_No project named `{}`. Try `!projects list` to see registered projects._",
                         name
                     ))
                 }
@@ -965,7 +1087,7 @@ fn execute_magic_command(cmd: MagicCommand<'_>, is_first_turn: bool) -> MagicRes
                 Some(p) => p,
                 None => {
                     return MagicResult::Reject(format!(
-                        "_No project named `{}`. Try `!list` to see registered projects._",
+                        "_No project named `{}`. Try `!projects list` to see registered projects._",
                         project
                     ))
                 }
@@ -980,7 +1102,43 @@ fn execute_magic_command(cmd: MagicCommand<'_>, is_first_turn: bool) -> MagicRes
                 prompt,
             }
         }
+        // Intercepted in handle_full_session_inner before this function runs;
+        // they need async store access that this sync routine doesn't have.
+        MagicCommand::SessionList | MagicCommand::SessionResume { .. } => {
+            unreachable!("session subcommands are dispatched above execute_magic_command")
+        }
     }
+}
+
+fn format_session_list(slack_bound: &std::collections::HashSet<String>) -> String {
+    // Cap at 30 most-recent — uncapped lists balloon on machines with
+    // thousands of historic sessions, and Slack truncates messages over
+    // ~40 KB anyway.
+    const MAX: usize = 30;
+    let (sessions, total) = crate::discovery::enumerate_recent_sessions(MAX);
+    if sessions.is_empty() {
+        return "_No claude sessions found on disk yet._".to_string();
+    }
+    let mut out = String::new();
+    out.push_str("*Claude sessions on disk* (most-recent first):\n\n");
+    for s in &sessions {
+        let cwd = s.cwd.as_deref().unwrap_or("(unknown cwd)");
+        let age = crate::discovery::relative_age(s.mtime_unix);
+        let tag = if slack_bound.contains(&s.session_id) {
+            " — `slack`"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "• `{}` — `{}` — {}{}\n",
+            s.session_id, cwd, age, tag
+        ));
+    }
+    if total > MAX {
+        out.push_str(&format!("\n_…and {} more (not shown)._\n", total - MAX));
+    }
+    out.push_str("\n_Resume one in this thread with_ `!sessions resume <session-id>` _(first turn only)._");
+    out
 }
 
 fn add_project_via_command(name: &str, path_str: &str) -> String {
@@ -1136,12 +1294,15 @@ fn format_help() -> String {
     out.push_str("• `!reset` → clear the thread's session and start fresh on the next message (keeps `cwd`). `!reset <project> [<message>]` to also rebind.\n");
     out.push_str("• `!silent <message>` → run silently — reactions only (:eyes: → :white_check_mark: / :x:), no streaming or final reply. Composes with `!start`: `!silent !start <project> <message>`.\n");
     out.push_str("• `!delete <slack-message-link>` → delete a bot-authored message by permalink (Slack rejects with `cant_delete_message` if the target wasn't authored by the bot).\n");
-    out.push_str("\n*Registry commands* (allowlisted senders only, no Claude spawn):\n");
-    out.push_str("• `!list` — show registered projects + default working directory\n");
-    out.push_str("• `!add <name> <path>` — register a project (path can use `~`)\n");
-    out.push_str("• `!remove <name>` (or `!rm <name>`) — remove a registered project\n");
-    out.push_str("• `!set-default <path>` — set default working directory for unprefixed DMs\n");
-    out.push_str("\n*Allowlist commands* (allowlisted senders only):\n");
+    out.push_str("\n*Project registry* (allowlisted senders only, no Claude spawn):\n");
+    out.push_str("• `!projects` (or `!projects list`) — show registered projects + default working directory\n");
+    out.push_str("• `!projects add <name> <path>` — register a project (path can use `~`)\n");
+    out.push_str("• `!projects remove <name>` — remove a registered project\n");
+    out.push_str("• `!projects set-default <path>` — set default working directory for unprefixed DMs\n");
+    out.push_str("\n*Sessions* (allowlisted senders only, no Claude spawn):\n");
+    out.push_str("• `!sessions` (or `!sessions list`) — list all claude sessions on disk (slack-bound + standalone) with cwd and recency\n");
+    out.push_str("• `!sessions resume <session-id>` — bind *this* thread to an existing claude session (first turn only)\n");
+    out.push_str("\n*Allowlist* (allowlisted senders only):\n");
     out.push_str("• `!allow list` — show allowlisted Slack user IDs\n");
     out.push_str("• `!allow add <user-id>` — grant a Slack user full-tools access\n");
     out.push_str("• `!allow remove <user-id>` — revoke access\n");

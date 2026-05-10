@@ -4,6 +4,7 @@ mod credentials;
 mod delete;
 mod projects;
 mod service;
+mod sessions;
 mod status;
 
 use anyhow::{anyhow, Context, Result};
@@ -61,6 +62,26 @@ enum Command {
     Delete {
         /// A Slack message permalink (right-click message → Copy link).
         link: String,
+    },
+    /// List or resume claude sessions on disk (slack-bound + standalone)
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// List the most recent claude sessions found under ~/.claude/projects/
+    List {
+        /// Maximum number of sessions to show (default 30)
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+    /// Continue a claude session by id (looks up its cwd, then exec's `claude --resume`)
+    Resume {
+        /// The session UUID — get one from `slack-sessions sessions list` or the Slack thread announce
+        session_id: String,
     },
 }
 
@@ -146,10 +167,27 @@ fn main() -> Result<()> {
             AllowAction::Remove { user_id } => allow_remove(&user_id),
         },
         Command::Delete { link } => delete::run(&link),
+        Command::Sessions { action } => match action {
+            SessionsAction::List { limit } => sessions::list(limit),
+            SessionsAction::Resume { session_id } => sessions::resume(&session_id),
+        },
     }
 }
 
 fn setup_interactive() -> Result<()> {
+    // `rpassword` reads hidden input from `/dev/tty`-style sources. In a
+    // captured-stdout context (Claude Code Bash tool, CI, anything piped)
+    // it fails with a cryptic "failed to read from terminal". Detect the
+    // common case upfront and tell the user where to run it.
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "`slack-sessions setup` needs a real terminal — token entry uses hidden prompts that can't be captured.\n\
+             Open a terminal and run: slack-sessions setup\n\
+             (use `slack-sessions setup --check` to verify already-stored tokens; that one's fine non-tty)"
+        ));
+    }
+
     println!("slack-sessions setup");
     println!();
     println!("Two tokens are needed (find both at https://api.slack.com/apps -> your app):");
