@@ -59,7 +59,7 @@ fn enumerate_recent(limit: usize) -> (Vec<Discovered>, usize) {
         }
     }
     let total = headers.len();
-    headers.sort_by(|a, b| b.2.cmp(&a.2));
+    headers.sort_by_key(|h| std::cmp::Reverse(h.2));
     headers.truncate(limit);
     let out = headers
         .into_iter()
@@ -208,7 +208,7 @@ pub fn resume(session_id: &str) -> Result<()> {
     {
         use std::os::unix::process::CommandExt;
         let err = cmd.exec();
-        return Err(anyhow!("exec failed: {}", err));
+        Err(anyhow!("exec failed: {}", err))
     }
     #[cfg(not(unix))]
     {

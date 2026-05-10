@@ -64,7 +64,7 @@ pub fn enumerate_recent_sessions(limit: usize) -> (Vec<DiscoveredSession>, usize
         }
     }
     let total = headers.len();
-    headers.sort_by(|a, b| b.2.cmp(&a.2));
+    headers.sort_by_key(|h| std::cmp::Reverse(h.2));
     headers.truncate(limit);
     let out = headers
         .into_iter()
