@@ -505,6 +505,23 @@ async fn handle_full_session_inner(
     // bookkeeping. We post the message *before* spawning claude (capturing
     // `thread_ts` immediately) and update it once claude reports its
     // session id via the oneshot below.
+    // Detect concurrent ownership of the session transcript before spawning
+    // claude (issue #3). When the user has already `claude --resume <id>`-ed
+    // this session interactively in another terminal, spawning a second
+    // claude on the same JSONL silently kills one of them and leaves the
+    // Slack thread without a reply. Bail with a clear message instead.
+    if let Some(sid) = entry.claude_session_id.as_deref() {
+        if crate::claude::session_is_busy(&resolved_cwd, sid) {
+            let msg = format!(
+                "_session `{}` is held by another `claude --resume` — exit that terminal and resend, or `!reset` to start a fresh session._",
+                sid
+            );
+            let _ = post_reply(&client, &channel, &thread_ts, &msg).await;
+            let _ = add_reaction(&client, &channel, &trigger_ts, "x").await;
+            return Ok(());
+        }
+    }
+
     let announce_first_turn = entry.claude_session_id.is_none();
     let announce: Option<AnnounceSpec> = if announce_first_turn {
         post_announce(&client, &channel, &thread_ts, &user_id, surface).await

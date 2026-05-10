@@ -1,10 +1,64 @@
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
+
+/// Encode a cwd path the way Claude Code does for its on-disk transcript
+/// directory: both `/` and `.` are replaced with `-`. Example:
+/// `/Users/x/projects/foo` → `-Users-x-projects-foo`,
+/// `/Users/x/.claude/plugins/.../1.2.0` → `-Users-x--claude-plugins-...-1-2-0`.
+fn encode_cwd(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+fn session_transcript_path(cwd: &Path, session_id: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(
+        home.join(".claude")
+            .join("projects")
+            .join(encode_cwd(cwd))
+            .join(format!("{}.jsonl", session_id)),
+    )
+}
+
+/// Returns `true` if another process is currently holding the session's
+/// JSONL transcript open. Used to detect the case where a user has
+/// `claude --resume <id>`-ed the same session interactively while the
+/// daemon is about to spawn a turn — concurrent ownership corrupts the
+/// transcript and silently kills the daemon's subprocess (issue #3).
+///
+/// Best-effort: returns `false` (proceed) on any probe failure rather
+/// than blocking turns when the check itself is broken (e.g., no lsof,
+/// no HOME). Returns `false` when the transcript file doesn't exist
+/// yet — that's only possible mid-spawn of the very first turn, and the
+/// caller already gates on `resume_session_id.is_some()`.
+pub fn session_is_busy(cwd: &Path, session_id: &str) -> bool {
+    let path = match session_transcript_path(cwd, session_id) {
+        Some(p) => p,
+        None => return false,
+    };
+    if !path.exists() {
+        return false;
+    }
+    let output = match std::process::Command::new("lsof")
+        .arg("-t")
+        .arg(&path)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(error = %e, "lsof probe failed; assuming session is free");
+            return false;
+        }
+    };
+    !output.stdout.iter().all(|b| b.is_ascii_whitespace())
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -166,4 +220,36 @@ pub async fn run_turn(
         session_id,
         text: final_text,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_cwd_no_dots() {
+        assert_eq!(
+            encode_cwd(Path::new("/Users/x/projects/foo")),
+            "-Users-x-projects-foo"
+        );
+    }
+
+    #[test]
+    fn encode_cwd_with_dots() {
+        assert_eq!(
+            encode_cwd(Path::new("/Users/x/.claude/plugins/v/1.2.0")),
+            "-Users-x--claude-plugins-v-1-2-0"
+        );
+    }
+
+    #[test]
+    fn encode_cwd_root() {
+        assert_eq!(encode_cwd(Path::new("/")), "-");
+    }
+
+    #[test]
+    fn session_is_busy_missing_file_is_free() {
+        let tmp = std::env::temp_dir().join(format!("ssX-{}", std::process::id()));
+        assert!(!session_is_busy(&tmp, "deadbeef-no-such-session"));
+    }
 }
