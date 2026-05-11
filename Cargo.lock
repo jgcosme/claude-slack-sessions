@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "slack-sessions-cli"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1710,7 +1710,7 @@ dependencies = [
 
 [[package]]
 name = "slack-sessionsd"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "dirs",
  "json5",
