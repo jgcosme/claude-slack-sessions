@@ -99,6 +99,12 @@ pub fn enumerate_recent_sessions(limit: usize) -> (Vec<DiscoveredSession>, usize
         if !has_cli {
             continue;
         }
+        // Drop sessions the user never actually prompted into — opened
+        // and immediately /exit'd, or aborted before any real turn. Both
+        // ai-title and last-prompt are absent in that case.
+        if title.is_none() {
+            continue;
+        }
         interactive_matches += 1;
         if out.len() < limit {
             out.push(DiscoveredSession {
