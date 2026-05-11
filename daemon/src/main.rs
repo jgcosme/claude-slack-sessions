@@ -365,9 +365,12 @@ async fn handle_full_session_inner(
     let (prompt_text, resolved_cwd) = if let Some(parsed) = parse_magic_command(&text) {
         match parsed {
             Ok(MagicCommand::SessionList) => {
+                // Drop our own entry lock before snapshotting every thread's
+                // session_id — known_session_ids() locks each entry in turn
+                // and would deadlock on the one we hold here.
+                drop(entry);
                 let bound = store.known_session_ids().await;
                 let reply = format_session_list(&bound);
-                drop(entry);
                 post_reply(&client, &channel, &thread_ts, &reply).await?;
                 return Ok(());
             }
@@ -481,13 +484,26 @@ async fn handle_full_session_inner(
                     channel: target_channel,
                     ts: target_ts,
                 } => {
-                    let reply = match delete_message(&client, &target_channel, &target_ts).await
-                    {
-                        Ok(()) => "_deleted_".to_string(),
-                        Err(e) => format!("_delete failed:_ {}", e),
-                    };
                     drop(entry);
-                    post_reply(&client, &channel, &thread_ts, &reply).await?;
+                    // Silent confirmation via reaction on the user's
+                    // command message — no thread reply. ✓ on success,
+                    // ✗ on failure. Failure detail goes to the daemon log
+                    // since there's no inline reply to carry it.
+                    match delete_message(&client, &target_channel, &target_ts).await {
+                        Ok(()) => {
+                            let _ = add_reaction(
+                                &client,
+                                &channel,
+                                &trigger_ts,
+                                "white_check_mark",
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "delete failed");
+                            let _ = add_reaction(&client, &channel, &trigger_ts, "x").await;
+                        }
+                    }
                     return Ok(());
                 }
                 MagicResult::Reset {
@@ -1111,17 +1127,17 @@ fn execute_magic_command(cmd: MagicCommand<'_>, is_first_turn: bool) -> MagicRes
 }
 
 fn format_session_list(slack_bound: &std::collections::HashSet<String>) -> String {
-    // Cap at 30 most-recent — uncapped lists balloon on machines with
-    // thousands of historic sessions, and Slack truncates messages over
-    // ~40 KB anyway.
-    const MAX: usize = 30;
+    // Cap at 10 most-recent — keeps the message compact in Slack and
+    // covers the common "what was I just working on" case.
+    const MAX: usize = 10;
     let (sessions, total) = crate::discovery::enumerate_recent_sessions(MAX);
     if sessions.is_empty() {
-        return "_No claude sessions found on disk yet._".to_string();
+        return "_No interactive Claude sessions found on disk yet._".to_string();
     }
     let mut out = String::new();
-    out.push_str("*Claude sessions on disk* (most-recent first):\n\n");
+    out.push_str("*Interactive Claude sessions* (most-recent first):\n\n");
     for s in &sessions {
+        let title = s.title.as_deref().unwrap_or("(untitled)");
         let cwd = s.cwd.as_deref().unwrap_or("(unknown cwd)");
         let age = crate::discovery::relative_age(s.mtime_unix);
         let tag = if slack_bound.contains(&s.session_id) {
@@ -1130,8 +1146,8 @@ fn format_session_list(slack_bound: &std::collections::HashSet<String>) -> Strin
             ""
         };
         out.push_str(&format!(
-            "• `{}` — `{}` — {}{}\n",
-            s.session_id, cwd, age, tag
+            "• *{}* — `{}` — `{}` — {}{}\n",
+            title, s.session_id, cwd, age, tag
         ));
     }
     if total > MAX {
