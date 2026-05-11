@@ -10,7 +10,7 @@ mod session;
 use slack_morphism::prelude::*;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::allowlist::Allowlist;
 use crate::credentials::Credentials;
@@ -1373,8 +1373,22 @@ async fn post_reply(
         SlackMessageContent::new().with_text(text.to_string()),
     )
     .with_thread_ts(thread_ts.clone());
-    let resp = session.chat_post_message(&req).await?;
-    Ok(resp.ts)
+    debug!(
+        channel = %channel.0,
+        thread_ts = %thread_ts.0,
+        bytes = text.len(),
+        "post_reply: chat.postMessage"
+    );
+    match session.chat_post_message(&req).await {
+        Ok(resp) => {
+            debug!(channel = %channel.0, ts = %resp.ts.0, "post_reply: ok");
+            Ok(resp.ts)
+        }
+        Err(e) => {
+            debug!(channel = %channel.0, error = %e, "post_reply: err");
+            Err(e.into())
+        }
+    }
 }
 
 async fn update_message(
@@ -1390,8 +1404,22 @@ async fn update_message(
         SlackMessageContent::new().with_text(text.to_string()),
         ts.clone(),
     );
-    session.chat_update(&req).await?;
-    Ok(())
+    debug!(
+        channel = %channel.0,
+        ts = %ts.0,
+        bytes = text.len(),
+        "update_message: chat.update"
+    );
+    match session.chat_update(&req).await {
+        Ok(_) => {
+            debug!(channel = %channel.0, ts = %ts.0, "update_message: ok");
+            Ok(())
+        }
+        Err(e) => {
+            debug!(channel = %channel.0, ts = %ts.0, error = %e, "update_message: err");
+            Err(e.into())
+        }
+    }
 }
 
 /// Post a fresh top-level message (no `thread_ts`). Used for the
@@ -1681,6 +1709,11 @@ fn send_with_overflow_recovery<'a>(
     text: &'a str,
 ) -> SendFuture<'a> {
     Box::pin(async move {
+        debug!(
+            placeholder = placeholder_ts.map(|t| t.0.as_str()).unwrap_or("none"),
+            bytes = text.len(),
+            "send_with_overflow_recovery: enter"
+        );
         let first_attempt = match placeholder_ts {
             Some(ts) => update_message(client, channel, ts, text)
                 .await
@@ -1688,7 +1721,10 @@ fn send_with_overflow_recovery<'a>(
             None => post_reply(client, channel, thread_ts, text).await,
         };
         match first_attempt {
-            Ok(ts) => Ok(ts),
+            Ok(ts) => {
+                debug!(ts = %ts.0, "send_with_overflow_recovery: ok (no split)");
+                Ok(ts)
+            }
             Err(e) if is_msg_too_long_error(e.as_ref()) => {
                 let Some((head, tail)) = split_in_half(text) else {
                     return Err(e);
@@ -1699,14 +1735,20 @@ fn send_with_overflow_recovery<'a>(
                     tail_bytes = tail.len(),
                     "msg_too_long; splitting and retrying"
                 );
-                let _ = send_with_overflow_recovery(
-                    client,
-                    channel,
-                    thread_ts,
-                    placeholder_ts,
-                    &head,
-                )
-                .await?;
+                // Abandon the streaming placeholder and post both halves
+                // as fresh threaded replies. Mixing `chat.update` (head
+                // into placeholder) with `chat.postMessage` (tail) opened
+                // a bug surface where head could be double-delivered;
+                // routing both halves through post_reply makes the
+                // recovery path uniform. The placeholder is deleted so
+                // the stale streaming snapshot doesn't linger above the
+                // final pair.
+                if let Some(ts) = placeholder_ts {
+                    if let Err(e) = delete_message(client, channel, ts).await {
+                        warn!(error = %e, "failed to delete placeholder before split-and-retry");
+                    }
+                }
+                send_with_overflow_recovery(client, channel, thread_ts, None, &head).await?;
                 send_with_overflow_recovery(client, channel, thread_ts, None, &tail).await
             }
             Err(e) => Err(e),
